@@ -153,8 +153,37 @@ static int hooked_CMvLayer_Draw(void *layer, int x, int y, void *tile_points, in
     return SO_CONTINUE(int, hook_CMvLayer_Draw, layer, x, y, tile_points, flag4, flag5);
 }
 
+// Bug #11 (port_progress.md): DrawMissionMode() crashes dereferencing this+0x84
+// (a CGsKeymap* -- confirmed against out_ghidra.c:83854, in_r0[0x21] = piVar2,
+// index 0x21*4 = 0x84) because CMvNetworkMenu::Initialize() used to be fully
+// no-op'd for "offline mode". The real Initialize() (out_ghidra.c:83856-83959)
+// never touches the network at all -- it only builds ~20 local CGsKeymap menu
+// keymaps and a CGsKeymapScroll for local UI navigation, then calls
+// ChangeState(). The only reason it was unsafe to run for real was Bug #3
+// (Gcx_MM_Alloc's fixed-block allocator ran out of slots on the 5th CGsKeymap
+// and returned NULL) -- now fixed by redirecting operator new/delete to the
+// native heap, so there's no more reason to skip this function's real logic.
+static so_hook hook_CMvNetworkMenu_Initialize;
+
 static void hooked_CMvNetworkMenu_Initialize(void *self) {
-    l_info("CMvNetworkMenu::Initialize stubbed (offline mode).");
+    l_info("CMvNetworkMenu::Initialize running for real (local UI setup, no network I/O).");
+    // SO_CONTINUE assigns its call's result to a local `type r`, which doesn't
+    // compile for `void` -- same restore/call/repatch sequence, inlined here.
+    kuKernelCpuUnrestrictedMemcpy((void *)hook_CMvNetworkMenu_Initialize.addr,
+                                  hook_CMvNetworkMenu_Initialize.orig_instr,
+                                  sizeof(hook_CMvNetworkMenu_Initialize.orig_instr));
+    kuKernelFlushCaches((void *)hook_CMvNetworkMenu_Initialize.addr,
+                         sizeof(hook_CMvNetworkMenu_Initialize.orig_instr));
+    if (hook_CMvNetworkMenu_Initialize.thumb_addr) {
+        ((void(*)(void*))hook_CMvNetworkMenu_Initialize.thumb_addr)(self);
+    } else {
+        ((void(*)(void*))hook_CMvNetworkMenu_Initialize.addr)(self);
+    }
+    kuKernelCpuUnrestrictedMemcpy((void *)hook_CMvNetworkMenu_Initialize.addr,
+                                  hook_CMvNetworkMenu_Initialize.patch_instr,
+                                  sizeof(hook_CMvNetworkMenu_Initialize.patch_instr));
+    kuKernelFlushCaches((void *)hook_CMvNetworkMenu_Initialize.addr,
+                         sizeof(hook_CMvNetworkMenu_Initialize.patch_instr));
 }
 
 static void hooked_CMvNet_SendMain(void *self) {
@@ -217,8 +246,17 @@ void so_patch(void) {
         l_warn("Symbol CMvLayerData::PreLoad not found for hooking");
     }
 
+    // Bug #11: let CMvNetworkMenu::Initialize() run for real (local UI setup only,
+    // see comment above hooked_CMvNetworkMenu_Initialize) instead of no-op'ing it.
+    uintptr_t cmv_network_menu_init_addr = so_symbol(&so_mod, "_ZN14CMvNetworkMenu10InitializeEv");
+    if (cmv_network_menu_init_addr) {
+        hook_CMvNetworkMenu_Initialize = hook_addr(cmv_network_menu_init_addr, (uintptr_t)&hooked_CMvNetworkMenu_Initialize);
+        l_info("Hooked CMvNetworkMenu::Initialize -> 0x%08x", (unsigned int) cmv_network_menu_init_addr);
+    } else {
+        l_warn("Symbol CMvNetworkMenu::Initialize not found for hooking");
+    }
+
     // Bypass dead online multiplayer/auction network subsystems
-    patch_symbol("_ZN14CMvNetworkMenu10InitializeEv", (uintptr_t)&hooked_CMvNetworkMenu_Initialize);
     patch_symbol("_ZN14CMvNetworkMenu11ResetKeyMapEv", (uintptr_t)&hooked_CMvNetworkMenu_ResetKeyMap);
     patch_symbol("_ZN6CMvNet8SendMainEv", (uintptr_t)&hooked_CMvNet_SendMain);
     patch_symbol("_ZN6CMvNet10InitializeEv", (uintptr_t)&hooked_CMvNet_Initialize);
