@@ -11,7 +11,7 @@ project(illusia C CXX)
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 
 # Vita application configuration
-set(VITA_APP_NAME "Illusia")
+set(VITA_APP_NAME "Illusia (Beta)")
 set(VITA_TITLEID "ILLUSIA01")
 set(VITA_VPKNAME "illusia")
 set(VITA_VERSION "01.00")
