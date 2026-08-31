@@ -23,10 +23,8 @@
 - ✅ Native sound (custom WAV mixer, see `source/utils/audio.c`), 30 FPS cap (matching the original
   engine's intended pacing), physical + touch controls, persistent saves
   (`ux0:data/illusia/saves/`), full LiveArea.
-- 🔧 **11 confirmed and resolved bugs**, each documented with its real root cause (no speculative
+- 🔧 **12 confirmed and resolved bugs**, each documented with its real root cause (no speculative
   patches) in [`port_progress.md`](port_progress.md).
-- ⚠️ **Known issue:** sound effects are sometimes dropped/cut off — see [Known Issues](#known-issues)
-  below.
 - 📋 Full porting plan and engine findings in [`PORTING_PLAN.md`](PORTING_PLAN.md).
 
 ## Requirements
@@ -65,17 +63,6 @@ physical buttons to the legacy keypad codes the engine already understood intern
 > The left analog stick also acts as a D-pad (fixed threshold in `source/main.c`).
 > Since the original engine was designed touch-first, some menu screens may respond better to a tap
 > than to the equivalent physical button — if something doesn't advance, try touching the screen.
-
-## Known Issues
-
-- **Sound effects are sometimes dropped or cut off mid-playback.** Root cause: `source/utils/audio.c`
-  only has a single SFX channel (`sfx_playing`/`sfx_pos`) — it has no polyphony. Whenever the game
-  triggers a new sound effect (`Natives.OnSoundPlay` → `audio_play()`) while another one is still
-  playing, the new call immediately overwrites the single channel's state, silently cutting off
-  whatever was already playing. This is very noticeable during combat, where multiple hit/skill/UI
-  sounds routinely overlap. Background music is unaffected (it has its own separate channel). Not
-  yet fixed — tracked as an open item for a future session (would need a small fixed-size pool of SFX
-  channels mixed together, instead of one shared slot).
 
 ## Building from source
 

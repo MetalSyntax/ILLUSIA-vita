@@ -7,6 +7,12 @@
 
 #define MAX_SOUNDS 130
 #define GRAIN 256
+// Bug #12 (port_progress.md): a single shared SFX slot meant a new sound
+// effect (e.g. casting a skill) silently overwrote/cut off whatever SFX was
+// still playing (e.g. a hit sound) instead of playing alongside it -- very
+// noticeable in combat, where hits/skills/UI sounds routinely overlap. This
+// pool lets up to MAX_SFX_CHANNELS play at once, all mixed together below.
+#define MAX_SFX_CHANNELS 6
 
 typedef struct {
     int16_t *data;
@@ -21,9 +27,14 @@ static int bgm_pos = 0;
 static int bgm_loop = 0;
 static int bgm_vol = 10;
 
-static int sfx_playing = -1;
-static int sfx_pos = 0;
-static int sfx_vol = 10;
+typedef struct {
+    int playing; // sound id, -1 = channel free
+    uint32_t pos;
+    int vol;
+} SfxChannel;
+
+static SfxChannel sfx_channels[MAX_SFX_CHANNELS];
+static int sfx_next_evict = 0;
 
 static SceUID audio_thd = -1;
 static int audio_running = 0;
@@ -69,14 +80,18 @@ static int audio_thread(SceSize args, void *argp) {
             }
         }
 
-        // Mix SFX
-        if (sfx_playing >= 0 && sounds[sfx_playing].data != NULL) {
+        // Mix SFX -- every active channel gets summed (with clamping) into the
+        // same buffer, instead of a single shared slot overwriting the last one.
+        for (int c = 0; c < MAX_SFX_CHANNELS; c++) {
+            int id = sfx_channels[c].playing;
+            if (id < 0 || sounds[id].data == NULL) continue;
+
             for (int i = 0; i < GRAIN; i++) {
-                if (sfx_pos >= sounds[sfx_playing].length_samples) {
-                    sfx_playing = -1;
+                if (sfx_channels[c].pos >= sounds[id].length_samples) {
+                    sfx_channels[c].playing = -1;
                     break;
                 }
-                int32_t s = buf[i] + (sounds[sfx_playing].data[sfx_pos++] * sfx_vol / 10);
+                int32_t s = buf[i] + (sounds[id].data[sfx_channels[c].pos++] * sfx_channels[c].vol / 10);
                 if (s > 32767) s = 32767;
                 if (s < -32768) s = -32768;
                 buf[i] = (int16_t)s;
@@ -94,7 +109,8 @@ static int audio_thread(SceSize args, void *argp) {
 
 void audio_init() {
     memset(sounds, 0, sizeof(sounds));
-    
+    for (int i = 0; i < MAX_SFX_CHANNELS; i++) sfx_channels[i].playing = -1;
+
     // Preload BGMs (100 to 111) to avoid lag, others lazy load
     for(int i = 100; i <= 111; i++) load_wav(i);
 
@@ -117,11 +133,25 @@ void audio_play(int id, int vol, int loop) {
         bgm_pos = 0;
         bgm_loop = loop;
         bgm_vol = vol;
-    } else {
-        sfx_playing = id;
-        sfx_pos = 0;
-        sfx_vol = vol;
+        return;
     }
+
+    // Find a free SFX channel; if all are busy, evict the oldest one
+    // (round-robin) instead of dropping the new sound on the floor.
+    int slot = -1;
+    for (int i = 0; i < MAX_SFX_CHANNELS; i++) {
+        if (sfx_channels[i].playing < 0) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == -1) {
+        slot = sfx_next_evict;
+        sfx_next_evict = (sfx_next_evict + 1) % MAX_SFX_CHANNELS;
+    }
+    sfx_channels[slot].playing = id;
+    sfx_channels[slot].pos = 0;
+    sfx_channels[slot].vol = vol;
 }
 
 void audio_stop_bgm() {
@@ -130,5 +160,5 @@ void audio_stop_bgm() {
 
 void audio_stop_all() {
     bgm_playing = -1;
-    sfx_playing = -1;
+    for (int i = 0; i < MAX_SFX_CHANNELS; i++) sfx_channels[i].playing = -1;
 }

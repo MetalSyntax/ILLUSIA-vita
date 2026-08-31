@@ -884,21 +884,26 @@ analizado todavía), LiveArea/VPK final. Un bug confirmado a la vez, guiado por 
 - **Fix:** en `source/patch.c`, `hooked_CMvNetworkMenu_Initialize` dejó de ser un no-op y ahora llama a la implementación real del `.so` (mismo patrón de "hook diagnóstico + passthrough" que ya se usaba para `CMvLayerData::PreLoad`, pero sin macro `SO_CONTINUE` porque esa macro no compila con tipo de retorno `void` -- se inlineó manualmente la secuencia restaurar-instrucción/llamar/re-parchear). `CMvNet::Initialize` y `CMvNet::SendMain` (la clase de red real, distinta de `CMvNetworkMenu`) siguen anuladas sin cambios -- esas sí hacen operaciones de red reales y no se tocaron.
 - **Estado:** compilado limpio (`psvita-toolkit build --preset debug`) y desplegado por FTP (`psvita-toolkit deploy --eboot --yes`). **Pendiente de que el usuario confirme en consola** que el crash de `DrawMissionMode` desaparece y que no reaparece el crash original del Bug #4 (`CMvNetworkMenu::ResetKeyMap`, que sigue con su propio stub no-op aparte).
 
-### Bug #12 -- ABIERTO, sin fix todavía (reportado por el usuario, 2026-08-30) -- Efectos de sonido que no siempre se escuchan
+### Bug #12 confirmado y resuelto (2026-08-30) -- Efectos de sonido que no siempre se escuchan (golpes/poderes)
 
-- **Síntoma:** reportado por el usuario -- durante el juego, algunos efectos de sonido (SFX) no se
-  escuchan, de forma intermitente. La música de fondo (BGM) no está afectada.
-- **Causa Raíz (confirmada leyendo el código, no especulada):** `source/utils/audio.c` implementa un
+- **Síntoma:** reportado por el usuario -- durante el juego, al lanzar un poder o pegarle a un enemigo,
+  el efecto de sonido (SFX) a veces no se escucha. La música de fondo (BGM) no está afectada.
+- **Causa Raíz (confirmada leyendo el código, no especulada):** `source/utils/audio.c` implementaba un
   mezclador propio con UN SOLO canal de SFX (`sfx_playing`/`sfx_pos`/`sfx_vol`, variables globales
   únicas). `audio_play()` (invocada desde `source/java.c` en el callback JNI `m_OnSoundPlay`, que a su
-  vez responde a `Natives.OnSoundPlay` del motor real) pisa ese único canal sin ninguna cola ni chequeo
-  de "¿ya hay un SFX sonando?": si el motor dispara un segundo efecto mientras el primero sigue en curso
-  (muy común en combate -- golpe + skill + sonido de UI superpuestos), el segundo `audio_play()`
-  simplemente sobreescribe `sfx_playing`/`sfx_pos` de golpe, cortando el primer sonido a mitad de
-  reproducción sin ningún aviso ni error -- el primero no termina, el segundo empieza. BGM no tiene este
-  problema porque usa sus propias variables (`bgm_playing`/`bgm_pos`) separadas del canal de SFX.
-- **No se aplicó fix todavía** -- se documenta para comunicar el problema conocido (ver `README.md`,
-  sección "Known Issues"). El fix natural sería reemplazar el único slot `sfx_playing`/`sfx_pos` por un
-  pool fijo de N canales de SFX (ej. 4-8) que se mezclen todos juntos en `audio_thread()` (mismo patrón
-  de suma+clamp que ya se usa para mezclar BGM+SFX en un solo canal), reciclando el canal más viejo si
-  los N están ocupados -- pero no se implementó en esta sesión, queda pendiente para la próxima.
+  vez responde a `Natives.OnSoundPlay` del motor real) pisaba ese único canal sin ninguna cola ni chequeo
+  de "¿ya hay un SFX sonando?": si el motor disparaba un segundo efecto mientras el primero seguía en
+  curso (muy común en combate -- golpe + skill + sonido de UI superpuestos), el segundo `audio_play()`
+  simplemente sobreescribía `sfx_playing`/`sfx_pos` de golpe, cortando el primer sonido a mitad de
+  reproducción sin ningún aviso -- el primero no terminaba, el segundo empezaba (o, si el motor disparaba
+  el sonido del golpe y CASI en el mismo frame el del poder, el usuario solo llegaba a escuchar el
+  último). BGM no tenía este problema porque usa sus propias variables (`bgm_playing`/`bgm_pos`)
+  separadas del canal de SFX.
+- **Fix:** en `source/utils/audio.c`, el único slot `sfx_playing`/`sfx_pos`/`sfx_vol` se reemplazó por un
+  pool fijo de `MAX_SFX_CHANNELS = 6` (`SfxChannel sfx_channels[6]`), todos mezclados juntos en
+  `audio_thread()` (mismo patrón de suma+clamp que ya mezclaba BGM+SFX). `audio_play()` busca un canal
+  libre (`playing < 0`); si los 6 están ocupados, recicla el más viejo por turno (`sfx_next_evict`,
+  round-robin) en vez de descartar el sonido nuevo. `audio_stop_all()` ahora limpia los 6 canales.
+- **Estado:** compilado limpio (`psvita-toolkit build --preset debug`) y desplegado por FTP
+  (`psvita-toolkit deploy --eboot --yes`). **Pendiente de que el usuario confirme en consola** que los
+  golpes y poderes ya se escuchan siempre, incluso superpuestos.
