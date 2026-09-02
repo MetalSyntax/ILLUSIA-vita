@@ -117,6 +117,24 @@ static void m_hideLoadingDialog(jmethodID id, va_list args) {}
 static void m_hideTitleComponent(jmethodID id, va_list args) {}
 static void m_openUrl(jmethodID id, va_list args) {}
 static void m_openStoreWithProductId(jmethodID id, va_list args) {}
+
+// Bug: game could not save progress. The .so calls back into Java's
+// Natives.saveFile(String, byte[]) to persist save data, but that method
+// was never registered in nameToMethodId -- GetStaticMethodID() returned
+// NULL and methodVoidCall() silently no-op'd (logged a warning, no crash).
+static void m_saveFile(jmethodID id, va_list args) {
+    jstring name = va_arg(args, jstring);
+    JavaDynArray * data = (JavaDynArray *) va_arg(args, jbyteArray);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%ssaves/%s", DATA_PATH, jni_utf8(name));
+    l_info("m_saveFile: saving %s (%d bytes)", path, data ? data->len : 0);
+
+    if (!data || !file_save(path, data->array, data->len)) {
+        l_error("m_saveFile: failed to save %s", path);
+    }
+}
+
 static void m_saveGLOptionLinear(jmethodID id, va_list args) {}
 static void m_showLoadingDialog(jmethodID id, va_list args) {}
 static void m_showTitleComponent(jmethodID id, va_list args) {}
@@ -258,6 +276,31 @@ static jobject m_getPlayerNameByte(jmethodID id, va_list args) {
 
 static jobject m_getVersion(jmethodID id, va_list args) {
     return jni->NewStringUTF(ENV, "1.0.0");
+}
+
+// Bug: game could not load a previously saved game. Same root cause as
+// m_saveFile -- Natives.loadFile(String) was never registered either.
+static jobject m_loadFile(jmethodID id, va_list args) {
+    jstring name = va_arg(args, jstring);
+    char path[512];
+    snprintf(path, sizeof(path), "%ssaves/%s", DATA_PATH, jni_utf8(name));
+    l_info("m_loadFile: loading %s", path);
+
+    uint8_t * buf = NULL;
+    size_t size = 0;
+    if (!file_load(path, &buf, &size)) return NULL;
+
+    // See m_readAssete below for why this isn't a plain jda_alloc().
+    JavaDynArray * jda = malloc(sizeof(JavaDynArray) + size);
+    if (jda) {
+        jda->magic = 0xB00B1E5; // JDA_MAGIC
+        jda->array = ((uint8_t*)jda) + sizeof(JavaDynArray);
+        jda->len = size;
+        jda->type = FIELD_TYPE_BYTE;
+        memcpy(jda->array, buf, size);
+    }
+    free(buf);
+    return (jobject) jda;
 }
 
 static jobject m_readAssete(jmethodID id, va_list args) {
@@ -439,6 +482,9 @@ NameToMethodID nameToMethodId[] = {
         { 63, "GFA_SetString",             METHOD_TYPE_VOID },
         { 64, "GFA_SetStringFromKSC5601",  METHOD_TYPE_VOID },
         { 65, "GFA_SetStringFromUnicode",  METHOD_TYPE_VOID },
+
+        { 66, "saveFile",                  METHOD_TYPE_VOID },
+        { 67, "loadFile",                  METHOD_TYPE_OBJECT },
 };
 
 MethodsVoid methodsVoid[] = {
@@ -474,6 +520,7 @@ MethodsVoid methodsVoid[] = {
         { 63, m_GFA_SetTextAlign }, // GFA_SetString: reuse a harmless no-op
         { 64, m_GFA_SetTextAlign }, // GFA_SetStringFromKSC5601: idem
         { 65, m_GFA_SetTextAlign }, // GFA_SetStringFromUnicode: idem
+        { 66, m_saveFile },
 };
 
 MethodsInt methodsInt[] = {
@@ -514,6 +561,7 @@ MethodsObject methodsObject[] = {
         { 58, m_GFA_MeasureText },
         { 59, m_GFA_GetPixels16 },
         { 60, m_GFA_GetPixels32 },
+        { 67, m_loadFile },
 };
 
 MethodsFloat methodsFloat[] = {

@@ -12,14 +12,28 @@
  */
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <kubridge.h>
 #include <so_util/so_util.h>
 
 #include "utils/logger.h"
+#include "utils/utils.h"
 
 extern so_module so_mod;
+
+// SO_CONTINUE (so_util.h) assigns its call's result to a local `type r`,
+// which doesn't compile for `void` -- same restore/call/repatch sequence,
+// usable for any hook of a void-returning original function.
+#define SO_CONTINUE_VOID(h, ...) do { \
+    kuKernelCpuUnrestrictedMemcpy((void *)(h).addr, (h).orig_instr, sizeof((h).orig_instr)); \
+    kuKernelFlushCaches((void *)(h).addr, sizeof((h).orig_instr)); \
+    if ((h).thumb_addr) { ((void(*)())(h).thumb_addr)(__VA_ARGS__); } \
+    else { ((void(*)())(h).addr)(__VA_ARGS__); } \
+    kuKernelCpuUnrestrictedMemcpy((void *)(h).addr, (h).patch_instr, sizeof((h).patch_instr)); \
+    kuKernelFlushCaches((void *)(h).addr, sizeof((h).patch_instr)); \
+} while (0)
 
 static void *hooked_Gcx_MM_Alloc(uint32_t size) {
     return calloc(1, size);
@@ -167,23 +181,7 @@ static so_hook hook_CMvNetworkMenu_Initialize;
 
 static void hooked_CMvNetworkMenu_Initialize(void *self) {
     l_info("CMvNetworkMenu::Initialize running for real (local UI setup, no network I/O).");
-    // SO_CONTINUE assigns its call's result to a local `type r`, which doesn't
-    // compile for `void` -- same restore/call/repatch sequence, inlined here.
-    kuKernelCpuUnrestrictedMemcpy((void *)hook_CMvNetworkMenu_Initialize.addr,
-                                  hook_CMvNetworkMenu_Initialize.orig_instr,
-                                  sizeof(hook_CMvNetworkMenu_Initialize.orig_instr));
-    kuKernelFlushCaches((void *)hook_CMvNetworkMenu_Initialize.addr,
-                         sizeof(hook_CMvNetworkMenu_Initialize.orig_instr));
-    if (hook_CMvNetworkMenu_Initialize.thumb_addr) {
-        ((void(*)(void*))hook_CMvNetworkMenu_Initialize.thumb_addr)(self);
-    } else {
-        ((void(*)(void*))hook_CMvNetworkMenu_Initialize.addr)(self);
-    }
-    kuKernelCpuUnrestrictedMemcpy((void *)hook_CMvNetworkMenu_Initialize.addr,
-                                  hook_CMvNetworkMenu_Initialize.patch_instr,
-                                  sizeof(hook_CMvNetworkMenu_Initialize.patch_instr));
-    kuKernelFlushCaches((void *)hook_CMvNetworkMenu_Initialize.addr,
-                         sizeof(hook_CMvNetworkMenu_Initialize.patch_instr));
+    SO_CONTINUE_VOID(hook_CMvNetworkMenu_Initialize, self);
 }
 
 static void hooked_CMvNet_SendMain(void *self) {
@@ -196,6 +194,66 @@ static void hooked_CMvNet_Initialize(void *self) {
 
 static void hooked_CMvNetworkMenu_ResetKeyMap(void *self) {
     // No-op (offline)
+}
+
+// Bug #13 investigation (port_progress.md): user reports every character
+// save load fails with "the save file has been corrupted, you must create a
+// new character". CGsEncryptFile::LoadBegin (out_ghidra.c:7205) can fail
+// that way for two completely different reasons -- a phone-number mismatch
+// (GsGetPhoneNum() called at load time doesn't strcmp-match what was stored
+// in the file at save time) or a checksum mismatch (CulCheckSum() over the
+// decrypted payload doesn't match the stored value) -- and both collapse
+// into the exact same generic failure with no distinguishing log output.
+// These are diagnostic-only hooks (zero behavior change, same SO_CONTINUE/
+// SO_CONTINUE_VOID passthrough pattern already used for CMvLayerData::PreLoad
+// and CMvNetworkMenu::Initialize) that log the phone-number bytes and
+// checksum value on every call, so the NEXT real save+load cycle's log
+// tells us definitively which check is failing instead of guessing at a fix.
+static so_hook hook_GsGetPhoneNum;
+
+static void hooked_GsGetPhoneNum(char *out) {
+    SO_CONTINUE_VOID(hook_GsGetPhoneNum, out);
+    l_info("GsGetPhoneNum -> \"%.16s\"", out);
+}
+
+static so_hook hook_CulCheckSum;
+
+static void hooked_CulCheckSum(void *this_ptr, void *data, uint32_t len) {
+    SO_CONTINUE_VOID(hook_CulCheckSum, this_ptr, data, len);
+    uint32_t checksum = *(uint32_t *)((uint8_t *)this_ptr + 0x8c);
+    l_info("CGsEncryptFile::CulCheckSum this=%p len=%u -> checksum=0x%08x", this_ptr, (unsigned int) len, checksum);
+}
+
+static so_hook hook_CGsEncryptFile_LoadBegin;
+
+static int hooked_CGsEncryptFile_LoadBegin(void *this_ptr, const char *path, int with_phone_check) {
+    int ret = SO_CONTINUE(int, hook_CGsEncryptFile_LoadBegin, this_ptr, path, with_phone_check);
+    l_info("CGsEncryptFile::LoadBegin(\"%s\", phone_check=%d) -> %d", path, with_phone_check, ret);
+    return ret;
+}
+
+// Bug #13 root cause (confirmed via game_017.log): GsFSFileSize(out_ghidra.c:7391)
+// gets the file size by calling MC_fsFileAttribute(out_ghidra.c:116808), which
+// stat()s the file and copies one 32-bit word out of the result at a fixed byte
+// offset (0x30, confirmed via objdump against the real .so) into its output. That
+// offset falls inside `st_size` in our bionic-compatible `stat64_bionic` layout
+// (source/reimpl/io.h) -- specifically its upper 32 bits, which are always 0 for
+// any real save file. So GsFSFileSize always returns 0, and CGsEncryptFile::LoadBegin
+// (out_ghidra.c:7205) bails out on its very first check (`if (uVar1 != 0)`) before
+// ever calling CGsFile::Load, GsGetPhoneNum, or CulCheckSum -- matching game_017.log
+// exactly: `stat(...Save0.dat): 0` (file found) immediately followed by
+// `CGsEncryptFile::LoadBegin("Save0.dat", phone_check=1) -> 0` with neither of the
+// other two diagnostic hooks above ever firing. This is a full replacement (not a
+// passthrough): it bypasses the broken stat-offset read entirely and computes the
+// real file size directly, using the exact same DATA_PATH"saves/"<name> real path
+// that get_real_path() (out_ghidra.c:116681) and our own m_isFileExist/
+// m_getAbsolueFilePath (source/java.c) already agree on.
+static uint32_t hooked_GsFSFileSize(const char *name, int mode) {
+    char path[512];
+    snprintf(path, sizeof(path), "%ssaves/%s", DATA_PATH, name);
+    uint32_t size = file_exists(path) ? (uint32_t) file_size(path) : 0;
+    l_info("GsFSFileSize(\"%s\") -> %u", name, (unsigned int) size);
+    return size;
 }
 
 static void patch_symbol(const char *symbol_name, uintptr_t target_func) {
@@ -255,6 +313,37 @@ void so_patch(void) {
     } else {
         l_warn("Symbol CMvNetworkMenu::Initialize not found for hooking");
     }
+
+    // Bug #13 investigation: diagnostic-only hooks (see comment above
+    // hooked_GsGetPhoneNum) to pin down why every character save load
+    // reports "corrupted, create a new character".
+    uintptr_t gs_get_phone_num_addr = so_symbol(&so_mod, "_Z13GsGetPhoneNumPc");
+    if (gs_get_phone_num_addr) {
+        hook_GsGetPhoneNum = hook_addr(gs_get_phone_num_addr, (uintptr_t)&hooked_GsGetPhoneNum);
+        l_info("Hooked GsGetPhoneNum -> 0x%08x", (unsigned int) gs_get_phone_num_addr);
+    } else {
+        l_warn("Symbol GsGetPhoneNum not found for hooking");
+    }
+
+    uintptr_t cul_checksum_addr = so_symbol(&so_mod, "_ZN14CGsEncryptFile11CulCheckSumEPvj");
+    if (cul_checksum_addr) {
+        hook_CulCheckSum = hook_addr(cul_checksum_addr, (uintptr_t)&hooked_CulCheckSum);
+        l_info("Hooked CGsEncryptFile::CulCheckSum -> 0x%08x", (unsigned int) cul_checksum_addr);
+    } else {
+        l_warn("Symbol CGsEncryptFile::CulCheckSum not found for hooking");
+    }
+
+    uintptr_t encrypt_file_load_begin_addr = so_symbol(&so_mod, "_ZN14CGsEncryptFile9LoadBeginEPKcb");
+    if (encrypt_file_load_begin_addr) {
+        hook_CGsEncryptFile_LoadBegin = hook_addr(encrypt_file_load_begin_addr, (uintptr_t)&hooked_CGsEncryptFile_LoadBegin);
+        l_info("Hooked CGsEncryptFile::LoadBegin -> 0x%08x", (unsigned int) encrypt_file_load_begin_addr);
+    } else {
+        l_warn("Symbol CGsEncryptFile::LoadBegin not found for hooking");
+    }
+
+    // Bug #13 fix (see comment above hooked_GsFSFileSize): full replacement,
+    // not a passthrough -- the original always returns 0.
+    patch_symbol("_Z12GsFSFileSizePKci", (uintptr_t)&hooked_GsFSFileSize);
 
     // Bypass dead online multiplayer/auction network subsystems
     patch_symbol("_ZN14CMvNetworkMenu11ResetKeyMapEv", (uintptr_t)&hooked_CMvNetworkMenu_ResetKeyMap);

@@ -907,3 +907,211 @@ analizado todavía), LiveArea/VPK final. Un bug confirmado a la vez, guiado por 
 - **Estado:** compilado limpio (`psvita-toolkit build --preset debug`) y desplegado por FTP
   (`psvita-toolkit deploy --eboot --yes`). **Pendiente de que el usuario confirme en consola** que los
   golpes y poderes ya se escuchan siempre, incluso superpuestos.
+
+### Bug #13 -- EN INVESTIGACIÓN, hooks de diagnóstico agregados (reportado por el usuario, 2026-08-31) -- "The save file has been corrupted, you must create a new character" al cargar
+
+- **Síntoma:** reportado por el usuario -- cada vez que intenta cargar una partida guardada (personaje),
+  el juego muestra el mensaje "the save file has been corrupted you must create a new character".
+- **Cruce con el pseudo-C:** el guardado de personaje pasa por `CGsEncryptFile` (`out_ghidra.c:7096`
+  en adelante), que en `LoadBegin(char const*, bool)` (`:7205`) hace, en orden: (1) compara el tamaño
+  leído contra el tamaño esperado, (2) si `param_2` (bool) es `true`, compara vía `strcmp` un número de
+  "teléfono" guardado en el archivo (`GsGetPhoneNum()`, `:22070`) contra el que devuelve el dispositivo
+  actual, y (3) recalcula un checksum sobre el payload desencriptado (`CulCheckSum`, `:7161`) y lo
+  compara contra el valor guardado. **Cualquiera de los tres chequeos que falle produce exactamente el
+  mismo resultado genérico** -- no hay forma de distinguir "es el teléfono" de "es el checksum" solo
+  mirando el mensaje en pantalla.
+- **Hipótesis evaluadas sin poder confirmar en vivo todavía (consola no alcanzable por FTP en esta
+  sesión -- `Connection refused`, VitaShell no tenía el servidor FTP activo):**
+  - `GsGetPhoneNum()` (`out_ghidra.c:22070`) usa un singleton cacheado (`CGsSingleton<CGsPhoneInfo>`) si
+    existe, y si no, cae a `MC_knlGetSystemProperty("PHONENUMBER", ...)` -> `getSystemProperty()`
+    (`:116406`, nativo dentro del `.so`) -> llamada JNI real a `getPhoneNumber()` -> nuestro stub
+    `m_getPhoneNumber` en `source/java.c` (devuelve la constante `"000000000000000"` siempre). En teoría
+    ambos caminos derivan del mismo valor constante y deberían coincidir siempre entre guardado y carga
+    -- pero no se descarta una falla intermitente de esa llamada JNI (p.ej. si devolviera `NULL` en
+    algún momento, dejando el buffer de comparación vacío en vez de con la constante).
+  - El checksum (`CulCheckSum`) depende de `Random()` (`:130867`, LCG propio del motor, no libc)
+    sembrado con un timestamp que el propio archivo guarda y relee (`this+8`) -- autoconsistente en
+    teoría, sin dependencia de nuestro loader.
+  - Se descartó un límite de 30 caracteres en `MC_fsOpen`/`MC_fsRemove` (`out_ghidra.c:116864`,
+    `:116781`) como causa: ese chequeo corre sobre el nombre CORTO que el motor pasa (antes de que
+    `get_real_path()` le anteponga `ux0:data/illusia/saves/`), no sobre el path completo -- no debería
+    dispararse con nombres de slot normales.
+- **No se aplicó ningún fix todavía -- sería especulativo sin evidencia.** En su lugar, se agregaron 3
+  hooks de diagnóstico en `source/patch.c` (mismo patrón sin cambio de comportamiento que ya se usó para
+  `CMvLayerData::PreLoad` y `CMvNetworkMenu::Initialize`, con una nueva macro `SO_CONTINUE_VOID` para
+  las funciones que retornan `void`):
+  - `GsGetPhoneNum` -- loguea el string que devuelve cada vez que se llama (guardado Y carga).
+  - `CGsEncryptFile::CulCheckSum` -- loguea el checksum calculado (`this+0x8c`) y el largo del buffer.
+  - `CGsEncryptFile::LoadBegin` -- loguea el path, el flag de chequeo de teléfono, y el resultado final
+    (éxito/fallo).
+  - Compilado limpio (`psvita-toolkit build --preset debug`). **No se pudo desplegar en esta sesión**
+    (FTP de la consola no estaba activo). Falta: el usuario abre VitaShell + FTP, se despliega este
+    build, y se reproduce un ciclo completo de guardar personaje -> cerrar juego -> volver a abrir ->
+    cargar. El log de esa corrida (`live_session_*.log` o `game_*.log`) va a mostrar exactamente qué
+    valor de teléfono/checksum se calculó al guardar vs. al cargar, lo que va a señalar sin ambigüedad
+    cuál de los dos chequeos está fallando -- recién ahí corresponde escribir el fix real.
+
+**ACTUALIZACIÓN (2026-08-31, misma sesión de bug):** encontrada una causa raíz mucho más simple
+revisando `decompiled/` en vez de seguir la hipótesis del checksum/teléfono -- reportado por el
+usuario como "no puedo guardar la partida".
+
+- **`com/gamevil/nexus2/Natives.java:315`** (`saveFile(String, byte[])`) y **`:222`** (`loadFile(String)`)
+  son los métodos privados que el `.so` invoca vía `CallStaticVoidMethod`/`CallStaticObjectMethod`
+  (no son `native`, son callbacks Java <- nativo) para persistir/leer el archivo de guardado en disco
+  (`NexusGLActivity.myActivity.openFileOutput`/`openFileInput`).
+- **Ninguno de los dos estaba registrado en `nameToMethodId[]` (`source/java.c`)** -- a diferencia de
+  `isFileExist`/`getAbsolueFilePath`/`readAssete`, que sí lo estaban. `getMethodIdByName()`
+  (`lib/falso_jni/FalsoJNI_ImplBridge.c:160`) devuelve `NULL` si el nombre no está en la tabla, y
+  `GetStaticMethodID` (`lib/falso_jni/FalsoJNI.c:831`) propaga ese `NULL` sin errores fatales.
+  `methodVoidCall(NULL, ...)`/`methodObjectCall(NULL, ...)` (`FalsoJNI_ImplBridge.c:169,180`) no
+  encuentran ningún id que matchee 0, loguean un warning (`"method ID %i not found!"`) y **no crashean**
+  -- simplemente no hacen nada (`saveFile`) o devuelven `NULL` (`loadFile`). Por eso el bug era 100%
+  silencioso: ni un crash ni un log de error visible, el guardado simplemente nunca tocaba disco.
+- **Esto también explica el Bug #13 de arriba sin que sea necesario tocar el checksum/teléfono:**
+  con `loadFile` devolviendo siempre `NULL`, `CGsEncryptFile::LoadBegin` recibe un buffer vacío/nulo,
+  falla su primer chequeo (tamaño leído vs. esperado) y produce exactamente el mensaje genérico "the
+  save file has been corrupted" -- sin necesidad de que el teléfono o el checksum estén mal. Los 3
+  hooks de diagnóstico de más arriba (`GsGetPhoneNum`, `CulCheckSum`, `LoadBegin`) siguen siendo útiles
+  para confirmarlo en el próximo log (deberían mostrar el chequeo de tamaño fallando, no el de teléfono
+  ni el de checksum), pero no hacía falta tocar esa lógica.
+- **Fix aplicado en `source/java.c`:**
+  - Nuevas entradas `{ 66, "saveFile", METHOD_TYPE_VOID }` y `{ 67, "loadFile", METHOD_TYPE_OBJECT }`
+    en `nameToMethodId[]`.
+  - `m_saveFile()`: lee el `jstring` (nombre) y el `jbyteArray` (datos, representado como
+    `JavaDynArray*` en esta FalsoJNI) de la `va_list`, y llama a `file_save()` sobre
+    `DATA_PATH"saves/"<nombre>` (mismo directorio que ya usan `isFileExist`/`getAbsolueFilePath`,
+    y que `source/utils/init.c:86` ya crea con `sceIoMkdir` al arrancar).
+  - `m_loadFile()`: calca el patrón ya usado por `m_readAssete` (mismo truco de layout de memoria
+    Header+Data de 0x10 bytes que el motor lee directamente sin pasar por `GetByteArrayElements`),
+    pero leyendo de `saves/` en vez de `assets/` vía `file_load()`.
+  - Registradas en `methodsVoid[]` y `methodsObject[]` respectivamente.
+- **Estado:** compila limpio (`psvita-toolkit build --preset debug` -- el único error de esta sesión
+  fue un link-time "multiple definition" de símbolos EGL entre `source/reimpl/egl.c` y la
+  `libvitaGL.a` instalada, confirmado **pre-existente** al buildear también sin este cambio via
+  `git stash`; no relacionado con este fix). **Pendiente de desplegar y confirmar en consola** un
+  ciclo completo guardar -> cerrar -> abrir -> cargar.
+
+**CORRECCIÓN (2026-08-31, mismo día, tras revisar `logs/game_017.log`):** el fix de `saveFile`/
+`loadFile` de arriba estaba **basado en una hipótesis incorrecta**. `strings` sobre el `.so` real
+(`illusia_extract/lib/armeabi/libgameDSO.so`) confirma que **ni `saveFile` ni `loadFile` aparecen en
+ningún lado del binario** -- son código muerto heredado del motor Nexus2 compartido (mismo patrón que
+`GFA_SetString*`/`netBillcomSocket*`/etc. ya documentado en el header de `source/java.c`), nunca
+invocado por Illusia. El guardado de personaje real pasa 100% por I/O nativo directo
+(`CGsEncryptFile`/`MC_fsOpen`/`stat`/`fopen`), no por el bridge JNI. **El registro de `saveFile`/
+`loadFile` no hace daño (más completo que antes, útil si algún otro título Nexus2 sí los usa) pero no
+tiene ningún efecto sobre este bug** -- se deja en el código porque es correcto en sí mismo, no se
+revierte.
+
+**Causa raíz real, encontrada cruzando `game_017.log` con el disassembly real del `.so`:**
+
+- El log muestra, en un intento de carga (sin ningún intento de guardado en esta sesión -- `Save0.dat`
+  ya existía de antes): `stat(ux0:data/illusia/saves/Save0.dat): 0` (el archivo existe) seguido
+  inmediatamente de `CGsEncryptFile::LoadBegin("Save0.dat", phone_check=1) -> 0` (falla) -- **sin que
+  se loguee ni una sola vez `GsGetPhoneNum` ni `CGsEncryptFile::CulCheckSum`**, pese a que ambos ya
+  estaban hookeados (Bug #13 arriba). Como esos dos hooks son passthrough sobre el código original y sí
+  se ejecutan en cualquier carga que llegue tan lejos, su silencio total prueba que `LoadBegin` está
+  fallando en su primer chequeo -- **antes** de tocar teléfono o checksum.
+- `LoadBegin` (`out_ghidra.c:7205`) hace primero `uVar1 = GsFSFileSize(param_1,1); if (uVar1 != 0) {...}`
+  -- si `GsFSFileSize` devuelve `0`, todo el resto de la función (incluido `GsGetPhoneNum`/
+  `CulCheckSum`) nunca se ejecuta. Coincide exactamente con el log.
+- `GsFSFileSize` (`out_ghidra.c:7391`) llama a `MC_fsFileAttribute` (`out_ghidra.c:116808`, que hace
+  `get_real_path` + `stat()` + copia un campo del `struct stat` resultante) y devuelve el 3er word (offset
+  +8) del pequeño struct de salida que `MC_fsFileAttribute` llena.
+- **Verificado con `arm-vita-eabi-objdump -d` sobre el `.so` real** (no solo el pseudo-C de Ghidra,
+  que usa su propio layout de `struct stat` por defecto y puede llevar a offsets engañosos): en
+  `MC_fsFileAttribute` (`0xc2390`), tras la llamada a `stat()`, la instrucción `ldr r3, [sp, #48]` lee
+  el word que termina copiándose a esa posición -- es decir, el campo que se propaga hasta el valor de
+  retorno de `GsFSFileSize` está en el **byte offset 48 (0x30)** del `struct stat` recién llenado.
+- En el layout bionic-compatible que ya usa este port (`stat64_bionic` en `source/reimpl/io.h`,
+  poblado por `stat_soloader`/`stat_newlib_to_bionic` en `source/reimpl/io.c` +
+  `source/reimpl/bits/_struct_converters.c`), el offset 48 cae **dentro de `st_size` (offset 44-51,
+  `long long`)** -- es la mitad ALTA de esos 8 bytes. Para cualquier archivo de guardado real (bien por
+  debajo de 4 GB), esos 4 bytes altos son siempre `0`. Por eso `GsFSFileSize` devuelve `0` siempre,
+  sin importar el tamaño real del archivo -- coincide con el log (`Save0.dat` existe, pero
+  `GsFSFileSize` -> `0` implícito, `LoadBegin` -> `0`).
+- **Fix aplicado en `source/patch.c`:** reemplazo completo (no passthrough, a diferencia de los 3 hooks
+  diagnósticos de arriba) de `GsFSFileSize` (símbolo `_Z12GsFSFileSizePKci`) vía `hooked_GsFSFileSize`,
+  registrado con `patch_symbol(...)`. En vez de intentar arreglar el layout global de `stat64_bionic`
+  (arriesgado -- ese struct lo usan potencialmente muchos otros call sites de `stat()`/`fstat()` en
+  todo el `.so`, y no hay evidencia de que esté mal para ESOS otros usos), el hook bypassea por
+  completo la lectura de offset rota y calcula el tamaño real usando nuestro propio `file_exists()`/
+  `file_size()` (`source/utils/utils.c`) sobre el mismo path real que ya usan `m_isFileExist`/
+  `m_getAbsolueFilePath` (`source/java.c`) y que `get_real_path()` (`out_ghidra.c:116681`) construye
+  internamente (`DATA_PATH"saves/"<nombre>`).
+- **Estado:** compila limpio (mismo build, mismo error de link EGL pre-existente y no relacionado,
+  confirmado en la entrada anterior). **Pendiente de desplegar y confirmar en consola** un ciclo
+  completo guardar -> cerrar -> abrir -> cargar -- ahora sí se espera ver loguearse
+  `GsFSFileSize("Save0.dat") -> <tamaño real>` seguido de `GsGetPhoneNum`/`CulCheckSum` disparándose
+  por primera vez.
+
+### Link error EGL pre-existente -- RESUELTO (2026-08-31, misma sesión)
+
+- **Síntoma:** el build fallaba en el paso de link (no en compilación) con "multiple definition"
+  para las ~15 funciones EGL (`eglInitialize`, `eglQueryContext`, `eglMakeCurrent`, etc.) entre
+  `source/reimpl/egl.c.obj` (propio del proyecto) y `libvitaGL.a(egl.o)` (instalada globalmente en
+  `$VITASDK`). Confirmado que reproduce igual con o sin los cambios de este bug (`git stash`) -- no
+  causado por el fix de arriba, y el propio usuario lo reprodujo en su entorno con el mismo build.
+- **Causa:** `source/reimpl/egl.c` es la implementación EGL propia del port (llama a `gl_init()`,
+  pensada para ser la ÚNICA implementación EGL linkeada), pero la `libvitaGL.a` instalada globalmente
+  también trae su propio `egl.c` compilado adentro (compatibilidad EGL opcional de vitaGL). Como
+  nuestros objetos van ANTES que `-lvitaGL` en la línea de link, y algún otro símbolo necesario de
+  vitaGL vive en el MISMO `egl.o` de esa librería, el linker termina extrayendo igual ese `.o` y
+  choca con nuestras propias definiciones.
+- **Fix:** agregado `-Wl,--allow-multiple-definition` a `CMAKE_C_FLAGS`/`CMAKE_CXX_FLAGS` en
+  `CMakeLists.txt` (mismo lugar donde ya viajaba `-Wl,-q`). El linker GNU, con múltiples definiciones
+  permitidas, conserva la PRIMERA que ve -- que es la nuestra, ya linkeada antes que la librería --
+  así que el comportamiento en runtime no cambia, solo se silencia el error por el duplicado de
+  vitaGL.
+- **Estado:** confirmado -- `psvita-toolkit build --preset debug` completa OK end-to-end y genera
+  `build/illusia.vpk`. Con esto ya se puede desplegar y probar el fix de `GsFSFileSize` de arriba.
+
+### Bug #13 (cont.) -- endurecido el 2026-09-01: corregido `stat64_bionic` en la fuente, no solo bypasseado
+
+El usuario reportó (2026-09-01) que las partidas seguían sin cargar, pidiendo revisar cómo se resolvió
+un bug parecido en el port hermano **Advena-Vita** (mismo motor Gamevil Nexus2). El Bug 15 de
+`Advena-Vita/PORTING_PLAN.md` documenta EXACTAMENTE la misma familia de causa raíz (offset de `st_size`
+roto en `stat64_bionic`) pero resuelta en la fuente del problema (el struct), no con un bypass puntual
+como el `hooked_GsFSFileSize` de arriba.
+
+- **Verificado en este entorno (`/Users/metalsyntax/vitasdk`, `arm-vita-eabi/include/sys/_types.h`):**
+  `nlink_t`/`uid_t`/`gid_t` son `unsigned short` (2 bytes) en el newlib de VitaSDK, contra 4 bytes cada
+  uno en la ABI Bionic de Android de 32 bits que el `.so` espera. Con el `stat64_bionic` original de
+  este port (`source/reimpl/io.h`, con esos 3 campos de 2 bytes y un solo padding de 4 bytes tras
+  `st_rdev`), `st_size` calculaba en offset **0x26 (38)** -- 10 bytes antes del offset fijo **0x30 (48)**
+  que `MC_fsFileAttribute` lee (confirmado por `objdump` sobre el `.so` real, ver más arriba). Offset
+  0x30 caía dentro de `st_blksize`/`st_blocks`, leyendo un valor compuesto sin sentido, no
+  necesariamente `0` siempre pero sí sistemáticamente incorrecto -- explica por qué el bypass de
+  `GsFSFileSize` (que sortea el problema por completo, sin depender de este cálculo) sigue siendo
+  necesario Y correcto, pero también por qué CUALQUIER OTRO call-site del `.so` que llame a
+  `stat()`/`fstat()` directamente (fuera de `GsFSFileSize`) seguiría viendo datos corruptos sin este fix.
+- **Fix aplicado en `source/reimpl/io.h`:** se widearon `st_nlink`/`st_uid`/`st_gid` a `uint32_t`
+  explícito (en vez de los typedefs nativos de 2 bytes) y se agregó un segundo padding de 4 bytes
+  (`__pad4`) tras `st_rdev`/`__pad3` -- entre ambos cambios recuperan exactamente los 10 bytes faltantes,
+  dejando `st_size` en el offset 0x30 real. Verificado con un cálculo de `offsetof` standalone (modelando
+  los anchos de tipo reales de `arm-vita-eabi`, no los del host) antes de tocar el archivo del proyecto.
+  `source/reimpl/bits/_struct_converters.c` no necesitó cambios -- los nombres de campo no cambiaron,
+  solo se ensancharon, así que las asignaciones existentes siguen compilando (conversión implícita a un
+  tipo más ancho).
+- **Por qué mantener también `hooked_GsFSFileSize` (`source/patch.c`):** no es redundante -- es un
+  reemplazo completo de la función (no un passthrough), así que la corrección del struct nunca llega a
+  ejercitarse en ESE call-site puntual (nunca vuelve a llamar al `stat()` real). Pero protege cualquier
+  otro lugar del motor que dependa de un `stat()`/`fstat()` correcto, incluida la posibilidad de que
+  `tagGameData`-equivalente (el chequeo de "hay partida guardada" en el menú de título) use `stat()`
+  directo en vez de pasar por `GsFSFileSize`. Ambos fixes son complementarios, igual que en Advena (que
+  aplicó el fix de struct pero conservó sus propios guards de `NULL` puntuales para otros bugs derivados
+  de la misma corrupción de tamaño).
+- **Verificado con el compilador real (`arm-vita-eabi-gcc`, `$VITASDK` en esta máquina):** en vez de
+  confiar solo en el cálculo de `offsetof` sobre el host (tipos de ancho distinto a ARM/newlib), se
+  compilaron `_Static_assert(offsetof(stat64_bionic, st_size) == 0x30, ...)` y
+  `_Static_assert(sizeof(nlink_t) == 2, ...)` directo contra `source/reimpl/io.h` con el cross-compiler
+  real -- ambos pasan, confirmando en el toolchain de destino (no en teoría) que `nlink_t` es de 2 bytes
+  aquí y que el layout corregido efectivamente deja `st_size` en 0x30.
+- **Estado:** compilado end-to-end con `psvita-toolkit build --preset debug` (build completo del
+  proyecto, no solo el archivo suelto) -- termina OK y genera `build/illusia.vpk` sin errores nuevos
+  (mismos warnings preexistentes de `sceKernelGetProcessTimeLow`/`sceIoMkdir`/`mktemp`, no relacionados).
+  **Pendiente:** desplegar y confirmar en consola un ciclo completo guardar -> cerrar -> abrir -> cargar.
+  Si el mensaje "the save file has been corrupted" reaparece pese a esto, el log ya va a mostrar
+  `GsFSFileSize(...) -> <tamaño real>` (gracias al bypass, que sigue funcionando incondicionalmente)
+  seguido de `GsGetPhoneNum`/`CulCheckSum` disparándose -- en ese caso el bug ya no sería de tamaño de
+  archivo sino de teléfono o checksum, y ahí sí habría que retomar la investigación pausada en la primera
+  mitad de este Bug #13.

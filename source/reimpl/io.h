@@ -45,11 +45,24 @@ typedef struct __attribute__((__packed__)) stat64_bionic {
     unsigned char __pad0[4];
     unsigned long __st_ino;
     unsigned int st_mode;
-    nlink_t st_nlink;
-    uid_t st_uid;
-    gid_t st_gid;
+    // Explicit uint32_t, NOT nlink_t/uid_t/gid_t: those typedefs are
+    // unsigned short (2 bytes) in VitaSDK's newlib (sys/_types.h) but
+    // 4 bytes each in the Android Bionic ABI the .so's compiled code
+    // expects. With the 2-byte newlib typedefs (and only one padding
+    // word below), st_size lands at byte offset 0x26 -- 10 bytes before
+    // the fixed offset 0x30 that the game's own MC_fsFileAttribute reads
+    // a file size word from (confirmed via objdump against the real
+    // .so). Widening these 3 fields to uint32_t recovers 6 of those 10
+    // bytes; the extra __pad4 word below recovers the remaining 4,
+    // landing st_size exactly at 0x30. Root cause confirmed on a
+    // sibling Gamevil Nexus2 port (Advena) where the same misalignment
+    // made every save file report size 0 and refuse to load.
+    uint32_t st_nlink;
+    uint32_t st_uid;
+    uint32_t st_gid;
     unsigned long long st_rdev;
     unsigned char __pad3[4];
+    unsigned char __pad4[4]; // see comment above -- required to land st_size at 0x30
     long long st_size;
     unsigned long st_blksize;
     unsigned long long st_blocks;
