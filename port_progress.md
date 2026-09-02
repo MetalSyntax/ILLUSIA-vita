@@ -1488,3 +1488,12 @@ cómo se gestiona el sonido antes de seguir parcheando síntomas.
   lado no contemplado todavía.
 - **Estado:** mejora de I/O aplicada y verificada con build real; diagnóstico instrumentado. Pendiente
   del log real del usuario para confirmar la causa exacta y si hace falta más trabajo.
+- **Confirmado en consola real (2026-09-02):** el usuario probó este build y reporta que la transición
+  mejoró ("mejoró un poco") -- consistente con que el `file_exists()` redundante y el buffer chico de
+  stdio SÍ eran parte real del costo, pero no necesariamente todo. **No es un fix completo todavía** --
+  sigue sin confirmarse con el log real de `CMvMap::Load`/`CMvMap::OpenWorldMap` (instrumentados arriba)
+  cuánto tiempo queda y si el remanente es I/O adicional (ej. texturas/`.pzx` grandes, u otros archivos
+  fuera de `fopen_soloader`), procesamiento en CPU dentro del propio `.so` (parseo/decodificación de
+  mapa, construcción de objetos), o el propio `OpenWorldMap()` legítimo sumando su propio costo justo
+  encima de la carga. Sin ese log, cualquier optimización adicional sería especulativa -- próximo paso
+  sigue siendo conseguirlo antes de tocar más código de esto.
