@@ -28,12 +28,29 @@ assets/
 /build/
 CMakeCache.txt
 CMakeFiles/
-Makefile
+# Anchored to the repo root: this is CMake's own generated top-level
+# Makefile from an in-source build, NOT a name to blanket-exclude anywhere
+# in the tree. An unanchored "Makefile" here previously also matched (and
+# so discarded) lib/vitagl/Makefile -- a real, must-be-tracked source file
+# vitaGL is built from (see below) -- when psvita-toolkit stages the repo
+# into a temp build dir via `rsync --filter=":- .gitignore"`. That rsync
+# filter mode does NOT support git's "!pattern" un-ignore syntax (verified:
+# a "!lib/vitagl/Makefile" line here is silently treated as a literal,
+# never-matching exclude pattern, not a re-include) -- anchoring the
+# pattern instead of trying to negate it is the fix that actually works
+# for both git and this rsync-based staging.
+/Makefile
 cmake_install.cmake
 *.elf
 *.self
 *.vpk
 *.suprx
+
+# Vendored vitaGL build products (source under lib/vitagl is tracked and
+# built in-tree by its own Makefile above, not by CMake).
+lib/vitagl/*.a
+lib/vitagl/source/**/*.o
+lib/vitagl/vitagl.stamp*
 
 # Debugging en consola real
 /logs/

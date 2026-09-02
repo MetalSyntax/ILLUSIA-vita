@@ -101,3 +101,4 @@ toolkit: `Continuar con un port existente` → elegí esta carpeta (ya tiene `.p
 - [x] **Audio / Sonido**: Implement `NexusSound` stubs (`OnSoundPlay`, `OnStopSound`) using a dedicated audio thread to play the WAV files directly via `sceAudioOutOutput`.
 - [x] **I/O de Guardado (Save States)**: Redirect I/O from `assets` to `saves` so save files load properly. (Done: redirected `m_getAbsolueFilePath` to `saves` and created the directory at boot).
 - [x] **FPS Cap**: Limit render loop to 30 FPS using `sceKernelGetProcessTimeLow` to prevent the game logic from running twice as fast.
+- [x] **vitaGL splashscreen removal**: Vendored vitaGL (`lib/vitagl/`, built with `NO_SPLASHSCREEN=1`) instead of linking the global VITASDK package, so the rotating vitaGL logo no longer plays before the game boots. See `port_progress.md` for the compat details.

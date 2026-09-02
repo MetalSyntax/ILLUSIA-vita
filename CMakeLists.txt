@@ -62,7 +62,12 @@ endif()
 # makes sincos, sincosf, etc. visible
 add_definitions(-D_GNU_SOURCE -D__POSIX_VISIBLE=999999)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -O3 -g -ffast-math -mfloat-abi=softfp -Wno-deprecated")
+# The globally-installed libvitaGL.a bundles its own egl.c (eglInitialize and
+# friends) in addition to this project's own source/reimpl/egl.c, which is
+# meant to be the only EGL implementation linked in. Our own objects are
+# always linked before -lvitaGL, so --allow-multiple-definition keeps our
+# definitions and just silences the duplicate-symbol error for vitaGL's copy.
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -Wl,--allow-multiple-definition -O3 -g -ffast-math -mfloat-abi=softfp -Wno-deprecated")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=gnu++20 -Wno-write-strings -Wno-psabi")
 
 add_executable(${CMAKE_PROJECT_NAME}
@@ -98,6 +103,29 @@ add_executable(${CMAKE_PROJECT_NAME}
 add_subdirectory(lib/libc_bridge)
 add_dependencies(${CMAKE_PROJECT_NAME} SceLibcBridge)
 
+# Vendored vitaGL (lib/vitagl, source only -- see .gitignore) instead of the
+# globally-installed VITASDK package, built with NO_SPLASHSCREEN=1 so the
+# rotating vitaGL logo/animation vitaGL normally shows during its own GXM
+# init doesn't play before the game's title screen. SOFTFP_ABI=1 matches
+# this project's own -mfloat-abi=softfp (armeabi/ARMv6 target, see Fase 1
+# of port_progress.md) -- must stay in sync with CMAKE_C_FLAGS below.
+set(VITAGL_MAKE_FLAGS_STR "SOFTFP_ABI=1 NO_SPLASHSCREEN=1")
+separate_arguments(VITAGL_MAKE_FLAGS UNIX_COMMAND "${VITAGL_MAKE_FLAGS_STR}")
+set(VITAGL_STAMP "${CMAKE_BINARY_DIR}/vitagl.stamp")
+
+# A stamp-file OUTPUT with no DEPENDS would only run once per build tree,
+# silently ignoring later VITAGL_MAKE_FLAGS_STR edits -- custom_target always
+# re-runs, and build_vitagl.sh itself decides whether `make clean` is needed
+# by comparing against the previous flags.
+add_custom_target(vitaGL_lib
+  COMMAND rm -f "${VITAGL_STAMP}.tmp"
+  COMMAND bash "${CMAKE_SOURCE_DIR}/lib/vitagl/build_vitagl.sh" "${VITAGL_MAKE_FLAGS_STR}" "${VITAGL_STAMP}" "${CMAKE_SOURCE_DIR}/lib/vitagl"
+  COMMAND make -C "${CMAKE_SOURCE_DIR}/lib/vitagl" ${VITAGL_MAKE_FLAGS}
+  BYPRODUCTS "${CMAKE_SOURCE_DIR}/lib/vitagl/libvitaGL.a"
+  COMMENT "Building vendored vitaGL (NO_SPLASHSCREEN=1)..."
+)
+add_dependencies(${CMAKE_PROJECT_NAME} vitaGL_lib)
+
 target_include_directories(${CMAKE_PROJECT_NAME} SYSTEM
                            PUBLIC ${CMAKE_SOURCE_DIR}/lib
                            )
@@ -109,7 +137,7 @@ target_include_directories(${CMAKE_PROJECT_NAME}
 target_link_libraries(${CMAKE_PROJECT_NAME}
                       -Wl,--whole-archive pthread -Wl,--no-whole-archive
                       stdc++
-                      vitaGL
+                      ${CMAKE_SOURCE_DIR}/lib/vitagl/libvitaGL.a
                       vitashark
                       SceShaccCgExt
                       taihen_stub

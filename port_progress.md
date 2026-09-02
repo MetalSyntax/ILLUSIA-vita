@@ -1115,3 +1115,61 @@ como el `hooked_GsFSFileSize` de arriba.
   seguido de `GsGetPhoneNum`/`CulCheckSum` disparándose -- en ese caso el bug ya no sería de tamaño de
   archivo sino de teléfono o checksum, y ahí sí habría que retomar la investigación pausada en la primera
   mitad de este Bug #13.
+
+## Vendorizado vitaGL propio -- eliminado el logo/animación de splashscreen (2026-09-01)
+
+- **Síntoma reportado por el usuario:** aparece un logo de vitaGL girando (animación 3D) antes de que
+  arranque el port.
+- **Causa:** vitaGL trae un splashscreen propio compilado incondicionalmente salvo que la librería se
+  compile con la flag de build `NO_SPLASHSCREEN=1` (mapeada a `-DSKIP_SPLASHSCREEN` en su Makefile,
+  confirmado via `nm`/`ar x` sobre el `libvitaGL.a` global instalado en `$VITASDK` -- tenía
+  `invoke_splashscreen`/`clear_splashscreen`/`splashscreen_thread` compilados adentro). Este proyecto
+  linkeaba contra ese `.a` global e instalado (`-lvitaGL` vía el paquete de VITASDK), sin control sobre
+  con qué flags se compiló -- no hay forma de deshabilitar el splash desde nuestro propio código sin
+  recompilar vitaGL con esa flag.
+- **Fix:** se vendorizó el código fuente de vitaGL (`lib/vitagl/`, tracked en git -- ver `.gitignore`)
+  en vez de depender del paquete global, igual que ya hacen varios ports hermanos en este mismo
+  workspace (`Dungeon-Hunter-2-vita`, `Asphalt-5-Vita`, `asphalt8-vita-main`). Reutilizado directamente
+  el árbol YA PARCHEADO de `Asphalt-5-Vita/lib/vitagl` (mismo `$VITASDK` de esta máquina) en vez de
+  clonar `Rinnegatamante/vitaGL` en HEAD -- un clone fresco falla al compilar contra este VITASDK
+  concreto (`source/gxm.c` usa `SCE_GXM_INITIALIZE_FLAG_*` que este `psp2/gxm.h` todavía no declara,
+  confirmado con el compilador real `arm-vita-eabi-gcc`, no solo en teoría) -- ese árbol de Asphalt-5-Vita
+  ya tiene el fix necesario (`shared.h` con `#ifndef`-guarded fallbacks para esas constantes, más un
+  guard de `HAVE_RAZOR` en `vgl.c`), documentado en su propio historial de git como un compat-patch de
+  una sesión anterior contra este mismo entorno.
+  - **Única diferencia respecto al árbol de Asphalt-5-Vita:** su patch además BORRA `source/egl.c` de
+    vitaGL (duplicado contra su propio `reimpl/egl.c`, más completo que el nuestro). Acá NO se borró --
+    nuestro `source/reimpl/egl.c` no implementa `eglBindAPI`/`eglGetDisplay`/`eglGetError`/
+    `eglGetProcAddress`/`eglSwapBuffers` (confirmado con un link real que falla con "undefined reference"
+    a esos 5 símbolos apenas se quita el `egl.c` de vitaGL) -- este proyecto SIEMPRE dependió
+    silenciosamente del `egl.c` de vitaGL para esos 5, con `-Wl,--allow-multiple-definition` (ya presente
+    en `CMakeLists.txt` de antes) resolviendo el resto de símbolos duplicados (`eglInitialize`,
+    `eglMakeCurrent`, etc., donde SÍ gana nuestra propia versión por ir primera en el link). Se restauró
+    el `egl.c` original de vitaGL (de un clone fresco de upstream, sin parchear -- no tiene APIs
+    específicas de gxm que puedan chocar con este VITASDK) dentro de `lib/vitagl/source/egl.c`.
+  - `CMakeLists.txt`: agregado un `add_custom_target(vitaGL_lib ...)` que corre `make -C lib/vitagl
+    SOFTFP_ABI=1 NO_SPLASHSCREEN=1` (mismo patrón de stamp-file + `build_vitagl.sh` que usan los ports
+    hermanos, para que un cambio de flags SÍ dispare un `make clean` -- un stamp basado en OUTPUT sin
+    DEPENDS quedaría "up to date" para siempre tras el primer build). `target_link_libraries` ahora
+    apunta al `.a` local (`lib/vitagl/libvitaGL.a`, gitignored -- build product) en vez del target
+    `vitaGL` del paquete global de VITASDK.
+  - **Bug de tooling encontrado y corregido en el camino:** `psvita-toolkit build` stagea el repo a un
+    directorio temporal con `rsync --filter=":- .gitignore"` antes de compilar. Ese modo de rsync **NO
+    soporta la sintaxis de negación `!patrón` de gitignore** (verificado empíricamente con un rsync de
+    prueba aislado: un `!lib/vitagl/Makefile` se trata como un patrón literal que nunca matchea nada, no
+    como un "no ignores esto") -- el `Makefile` de vitaGL (real, debe trackearse, es lo que `make -C
+    lib/vitagl` necesita para compilar) se estaba perdiendo en el staging por la regla genérica sin
+    anclar `Makefile` de este `.gitignore` (pensada solo para el `Makefile` que CMake genera en la raíz
+    del repo en un build in-source). Fix: anclar esa regla a `/Makefile` en vez de intentar negarla --
+    confirmado con el mismo test aislado de rsync que con el anclaje SÍ sobrevive el archivo real de
+    vitaGL. Este bug de tooling es independiente del de vitaGL en sí y afectaría a cualquier archivo
+    futuro llamado `Makefile` en subcarpetas de este repo.
+- **Verificado:** `nm` sobre el `libvitaGL.a` vendorizado ya compilado confirma que `splashscreen.o` no
+  aporta ningún símbolo (todo el archivo queda vacío bajo `#ifndef SKIP_SPLASHSCREEN`); `nm` sobre el
+  binario final linkeado (`build/illusia`, tanto en preset `debug` como `release`) confirma cero
+  símbolos con "splash" en el nombre. Build completo end-to-end con `psvita-toolkit build --preset
+  debug` Y `--preset release`, ambos generan `build/illusia.vpk` sin errores nuevos.
+- **Pendiente:** confirmar en consola/Vita3K que el juego arranca directo a pantalla de título sin la
+  animación, y que no hay regresión de renderizado por el `egl.c` restaurado (debería ser transparente --
+  es el mismo código que ya se usaba antes de vendorizar, solo que ahora vendorizado en vez de venir del
+  paquete global).
