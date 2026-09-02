@@ -100,6 +100,13 @@ static void m_OnSoundPlay(jmethodID id, va_list args) {
     int i = va_arg(args, int);
     int i2 = va_arg(args, int);
     int z = va_arg(args, int);
+    // `i` here is NOT the assets/sound/%03d filename number -- it's the
+    // position of the real id inside CGsSound's internal registered-id list
+    // (CGsSound::PlaySound/GetSoundIDListIdx, out_ghidra.c:19311/18499).
+    // See the confirmed translation table and its full explanation in
+    // audio_play()/audio.c (port_progress.md Bug #20) -- audio_play() logs
+    // the resolved real id right after this.
+    l_info("m_OnSoundPlay: index=%d vol=%d loop=%d", i, i2, z);
     if (i2 == 0 && z) {
         audio_stop_bgm();
     } else {

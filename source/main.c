@@ -116,6 +116,9 @@ int main() {
         { SCE_CTRL_SELECT, 0x23 },
     };
 
+    void audio_open_gate(void);
+    int first_frame = 1;
+
     uint32_t last_tick = sceKernelGetProcessTimeLow();
     while (1) {
         sceCtrlPeekBufferPositive(0, &pad, 1);
@@ -189,7 +192,12 @@ int main() {
 
         Natives_NativeRender(&jni, NULL);
         gl_swap();
-        
+
+        if (first_frame) {
+            audio_open_gate();
+            first_frame = 0;
+        }
+
         uint32_t current_tick = sceKernelGetProcessTimeLow();
         uint32_t target_tick = last_tick + 33333;
         if (current_tick < target_tick) {

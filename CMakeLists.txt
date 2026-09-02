@@ -137,6 +137,16 @@ target_include_directories(${CMAKE_PROJECT_NAME}
 target_link_libraries(${CMAKE_PROJECT_NAME}
                       -Wl,--whole-archive pthread -Wl,--no-whole-archive
                       stdc++
+                      # source/utils/audio.c uses SDL2 (SDL_OpenAudioDevice)
+                      # for audio output instead of raw sceAudioOut -- requires
+                      # vitasdk's SDL2 port (`vdpm install sdl2` if the build
+                      # fails to find <SDL2/SDL.h> or -lSDL2). libSDL2.a is one
+                      # static archive bundling every subsystem (video/joystick/
+                      # sensor/etc, not just audio), so the linker pulls in its
+                      # vitavideo backend's on-screen-keyboard code too, even
+                      # though we only call the audio API -- needs SceIme_stub.
+                      SDL2
+                      SceIme_stub
                       ${CMAKE_SOURCE_DIR}/lib/vitagl/libvitaGL.a
                       vitashark
                       SceShaccCgExt

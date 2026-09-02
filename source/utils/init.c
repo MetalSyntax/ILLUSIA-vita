@@ -24,6 +24,7 @@
 #include <psp2/net/net.h>
 #include <psp2/net/netctl.h>
 #include <psp2/sysmodule.h>
+#include <psp2/io/dirent.h>
 
 #include <falso_jni/FalsoJNI.h>
 #include <so_util/so_util.h>

@@ -1173,3 +1173,272 @@ como el `hooked_GsFSFileSize` de arriba.
   animación, y que no hay regresión de renderizado por el `egl.c` restaurado (debería ser transparente --
   es el mismo código que ya se usaba antes de vendorizar, solo que ahora vendorizado en vez de venir del
   paquete global).
+
+### Bug #14 confirmado y resuelto (2026-09-02) -- Sonidos ambientales y efectos en loop se cortaban tras una sola reproducción
+
+- **Síntoma:** reportado por el usuario -- sonidos ambientales y algunos efectos de poderes/golpes no
+  sonaban bien (dejaban de sonar, no continuaban en bucle como deberían).
+- **Causa Raíz (confirmada leyendo el motor real, no especulada):** el motor original (Android) decide
+  si un sonido va al slot único "sostenido" (loop, `mBgmPlayer`) o a un canal de un solo disparo
+  **basándose exclusivamente en el flag `loop`** que el juego pasa a `Natives.OnSoundPlay(id, vol, loop)`
+  (ver `NexusSound.playSound(int, boolean)` en
+  `decompiled/apk_jadx/sources/com/gamevil/nexus2/ui/NexusSound.java:113-145`) -- el `id` numérico del
+  sonido no tiene ningún rol en esa decisión.
+  Nuestro `source/utils/audio.c` (`audio_play()`) en cambio usaba una heurística hardcodeada y nunca
+  confirmada contra el motor real: `id >= 100 && id <= 111` = BGM, cualquier otro id iba siempre al pool
+  de 6 canales SFX (`SfxChannel`, agregado en el Bug #12) **sin importar el flag `loop`**. Ese pool no
+  tiene ningún concepto de repetición -- un sonido enrutado ahí SIEMPRE se reproduce una vez y se apaga
+  cuando llega al final de sus samples.
+  Los assets reales confirman ids de sonido en bucle (ambiente/loop) que caen FUERA del rango 100-111 --
+  `illusia_extract/assets/sound/120.wav` y `121.wav` -- y cualquier efecto de poder que el motor dispare
+  con `loop=true` (ej. un sonido sostenido mientras dura una habilidad) también caía en la misma trampa
+  si su id no estaba en 100-111. Resultado: esos sonidos sonaban una sola vez y luego silencio total, en
+  vez de repetirse como en Android.
+- **Fix:** en `source/utils/audio.c`, `audio_play()` ahora enruta por el flag `loop` real (igual que
+  `NexusSound.playSound`), no por rango de id: `if (loop)` va siempre al slot sostenido único
+  (`bgm_playing`/`bgm_pos`/`bgm_loop`/`bgm_vol`), reemplazando lo que sea que estuviera sonando ahí antes
+  -- misma limitación de "un solo loop a la vez" que tiene el motor original con su único `mBgmPlayer`,
+  no es una regresión nuestra. Cualquier sonido sin loop sigue yendo al pool polifónico de 6 canales
+  (comportamiento del Bug #12, sin cambios). También se agregó precarga de los ids 120/121 en
+  `audio_init()` junto a los BGM 100-111, para evitar un stutter en su primera reproducción.
+- **Estado:** corregido en código. Pendiente de build/deploy y confirmación del usuario en consola.
+
+### Bug #15 confirmado y resuelto (2026-09-02) -- El jingle de Gamevil sonaba antes de que el logo apareciera en pantalla
+
+- **Síntoma:** reportado por el usuario -- el audio del logo de Gamevil se escucha antes de que la imagen
+  del logo se muestre en pantalla.
+- **Causa Raíz:** confirmado en `out_ghidra.c:111917` (`CMvLogo::DoPlaySound`) que el jingle es
+  `CGsSound::Play(ms_pSingleton, 0, -1, '\0')` -- sonido id **0** (`000.wav`/`s000.ogg`). El problema no
+  es de contenido sino de sincronización: `audio_init()` arranca el hilo de mezcla nativo (`source/utils/audio.c`)
+  **antes** de `gl_init()` y de toda la secuencia de arranque (`NativeInitWithBufferSize`/
+  `NativeInitDeviceInfo`/`NativeResize`, `source/main.c`), y ese hilo empieza a reproducir cualquier sonido
+  encolado de inmediato (sin ninguna dependencia del estado gráfico). Si el motor dispara el `OnSoundPlay`
+  del jingle durante esa inicialización -- que hace I/O síncrona de archivos/texturas y puede tardar
+  bastante más que lo que tarda nuestro mezclador nativo en empezar a sonar -- el audio arranca (o incluso
+  termina) mientras el `main()` todavía no llegó a su primer `gl_swap()` real, es decir, antes de que
+  exista ni un solo frame visible en pantalla. En Android esto queda enmascarado porque `MediaPlayer.create()`
+  (el camino real de `NexusSound.playSound`) es de por sí lento/asíncrono -- nuestro mezclador C, al
+  reproducir PCM ya precargado, es mucho más rápido y expone la carrera.
+- **Fix:** en `source/utils/audio.c`, el hilo de mezcla ahora respeta un gate (`audio_gate_open`,
+  `audio_open_gate()`) que arranca cerrado -- mientras está cerrado, el buffer de salida se manda en
+  silencio y **ninguna posición de reproducción avanza** (ni BGM ni SFX), así que lo que haya quedado
+  encolado arranca desde el sample 0 apenas se abre el gate, sin perder el comienzo. En `source/main.c`,
+  el gate se abre con `audio_open_gate()` justo después del primer `gl_swap()` real del loop principal --
+  sincronizando el audio con el primer frame efectivamente visible en pantalla.
+- **Estado:** corregido en código. Pendiente de build/deploy y confirmación del usuario en consola.
+
+### Bug #16 confirmado y resuelto (2026-09-02) -- Ruido estridente en pantalla de Title y en cutscenes (en vez del sonido ambiente/BGM)
+
+- **Síntoma:** reportado por el usuario -- la pantalla de Title suena con un ruido estridente en vez del
+  ambiente que debería tener, y en un cutscene aparece otro efecto igual de estridente.
+- **Cruce con el pseudo-C real (no especulado):** `out_ghidra.c` tiene un log literal del propio juego
+  justo antes de la llamada que confirma el sonido de Title:
+  ```
+  MC_knlPrintk("##### GS_SOUND_PLAY( RES_BGM_TITLE ) Before #####");
+  CGsSound::Play(CGsSingleton<CGsSound>::ms_pSingleton, 0x6c, -1, '\x01');
+  ```
+  `0x6c` = **108** (`108.wav`/`s108.ogg`), con loop=`true`. El cutscene usa el mismo mecanismo de más
+  alto nivel: `CMvGameScript::Script_PlayBGM()` (`out_ghidra.c:45432`) también llama
+  `CGsSound::Play(ms_pSingleton, <id del script>, -1, '\x01')` -- mismo camino de loop, distinto id
+  (data-driven desde el script del cutscene, no fijo).
+  El `-1` en el 2º argumento le dice al motor "usar el volumen por defecto interno" (un campo del
+  singleton `CGsSound`, inicializado en 0 por el constructor -- `out_ghidra.c:19021` -- y cargado en
+  runtime desde las opciones de sonido guardadas, imposible de leer solo con disassembly estático, pero
+  el propio código Android confirma que la escala real de volumen del motor llega hasta
+  `NexusSound.MAX_VOLUME = 80`, muy por encima del rango 0-10 que asumía nuestro mezclador).
+  **El bug real (verificado leyendo `source/utils/audio.c`, no el volumen exacto):** el canal de
+  loop/BGM hacía `int32_t s = sample * bgm_vol / 10; buf[i] = s;` **sin clampear** antes de truncar a
+  `int16_t` -- si `bgm_vol` supera 10 (como todo indica que ocurre en la práctica, dado el rango real de
+  volumen del motor), el resultado se desborda del rango de 16 bits y, al truncarse, da vueltas
+  (wraparound) en vez de saturar -- eso es exactamente ruido digital estridente, no un simple "muy
+  fuerte". El pool de SFX (canales de un solo disparo, Bug #12) sí clampeaba correctamente desde que se
+  creó; solo al canal de loop le faltaba.
+- **Fix:** en `source/utils/audio.c`, se agregó el mismo clamp de saturación (`if (s>32767) s=32767; if
+  (s<-32768) s=-32768;`) que ya tenía el pool de SFX al canal de loop/BGM, antes de truncar a
+  `int16_t`. Esto cubre tanto el ambiente de Title (id 108) como cualquier BGM/ambiente de cutscene
+  (`Script_PlayBGM`), porque ambos pasan por el mismo canal único de loop.
+- **Aclaración sobre el hallazgo de `res/raw` (reportado por el usuario):** se confirmó que
+  `ux0_data/illusia/res/raw/sNNN.ogg` SÍ existe en el `.apk` real (70 archivos, mismos ids que
+  `assets/sound/`) y es el que usa el camino Android real
+  (`IllusiaUIControllerView.OnSoundPlay` → `NexusSound.playSound(R.raw.s000+i, z)`), en Ogg Vorbis
+  **16000 Hz estéreo** (confirmado con `ffprobe` sobre `s104.ogg`/`s000.ogg`/etc.), mientras que
+  `assets/sound/NNN.wav` (lo que usa nuestro mezclador nativo) es PCM **8000 Hz mono** -- una versión de
+  menor fidelidad del mismo master, empaquetada en el mismo `.apk` original con timestamps casi
+  idénticos (probablemente para un target de hardware más limitado del motor Nexus2 compartido). **No es
+  la causa de estos 3 bugs:** nuestro motor nunca pasa por el sistema de recursos de Android ni por
+  `res/raw` -- interceptamos el JNI `OnSoundPlay` directo y reproducimos el `.wav` equivalente en C, y
+  se confirmó que el `.wav` de id 108 tiene la duración correcta (12.86s vs 12.80s del `.ogg`, diferencia
+  despreciable de resampleo) y un header PCM válido -- el contenido no está roto, faltaba el clamp. Que
+  falte `res/raw` en el `ux0_data` de este port es esperable y no bloquea nada: **no forma parte de nuestra
+  cadena de audio actual.** Migrar a decodificar los `.ogg` de `res/raw` en vez de los `.wav` de
+  `assets/sound/` sería un cambio de fidelidad (stereo/16kHz en vez de mono/8kHz) que requeriría vendorizar
+  un decoder Vorbis (ej. stb_vorbis) -- una mejora de calidad a evaluar aparte, no necesaria para resolver
+  el ruido reportado.
+- **Estado:** corregido en código. Pendiente de build/deploy y confirmación del usuario en consola.
+
+### Bug #17 confirmado y resuelto (2026-09-02) -- Motor de audio migrado de .wav (8kHz mono) a .caf (22050Hz estéreo, IMA4 ADPCM)
+
+- **Síntoma:** reportado por el usuario -- el sonido debería usar los `.caf` de `assets/sound/`, que son
+  más nítidos que los `.wav` que estábamos usando.
+- **Confirmado con `afinfo` (herramienta nativa de Apple, no especulado):** los `.caf` de
+  `illusia_extract/assets/sound/` son uniformemente **2 canales, 22050 Hz, IMA4 ADPCM** (`ima4`, 68
+  bytes/paquete = 34 bytes por bloque de canal, 64 frames/paquete) en TODOS los ids revisados (108, 046,
+  000, 001, 002, 120, 121, 084) -- verificado también que la duración coincide exactamente con el `.wav`
+  correspondiente por id (ej. 108: 12.857s en ambos formatos), confirmando que son la MISMA grabación,
+  solo que el `.caf` es una versión de mayor fidelidad (estéreo, ~2.75x el sample rate) agregada al build
+  original ~4 meses después que el `.wav` (`.caf` fechado 2011-09-22 en el `.apk` vs `.wav` 2011-05-24).
+- **Fix:** reescrito `source/utils/audio.c` para decodificar `.caf`/IMA4 en vez de leer `.wav` como PCM
+  crudo:
+  - Implementado un decoder IMA4 QuickTime/CAF completo (tablas estándar de paso/índice de IMA ADPCM,
+    `ima4_decode_block()` decodifica un bloque de 34 bytes → 64 samples por canal) y un parser mínimo de
+    contenedor CAF (`caf_find_data_chunk()`, recorre la lista de chunks buscando `"data"`, saltando los 4
+    bytes de `mEditCount` que preceden el audio real dentro de ese chunk -- confirmado contra el "audio
+    data file offset" que reporta `afinfo`).
+  - `load_caf()` reemplaza a `load_wav()`: lee `assets/sound/%03d.caf`, decodifica todos los paquetes a
+    PCM estéreo intercalado en memoria.
+  - El puerto de audio (`sceAudioOutOpenPort`) pasó de `8000 Hz / MONO` a `22050 Hz / STEREO`
+    (`CAF_SAMPLE_RATE`/`CAF_CHANNELS`), y todo el mezclado en `audio_thread()` (canal de loop/BGM y pool
+    de SFX) ahora trabaja por frame estéreo en vez de por sample mono. `SoundFile.length_samples` pasó a
+    `length_frames` (cuenta de frames, no de samples intercalados) para reflejar esto.
+  - El clamp de saturación del Bug #16 se preservó (ahora aplicado por canal, L y R por separado).
+- **Estado:** corregido en código. Pendiente de build/deploy y confirmación del usuario en consola de que
+  el audio suena más nítido.
+
+### Bug #18 -- EN INVESTIGACIÓN, log de diagnóstico agregado (reportado por el usuario, 2026-09-02) -- posible sonido de cutscene con id equivocado (¿046-055 en vez de 100+?)
+
+- **Síntoma:** reportado por el usuario -- durante un cutscene suena algo que percibe parecido a uno de
+  los ids 046-055 (SFX corto), cuando según su criterio debería sonar uno de los ids 100 en adelante
+  (BGM/ambiente).
+- **Por qué NO se aplicó un fix todavía:** el id que se reproduce en un cutscene es 100% data-driven
+  dentro del `.so` original sin modificar -- `CMvGameScript::Script_PlayBGM`/`Script_PlaySound`
+  (`out_ghidra.c:45432` y `:45451`) leen el id de un campo del propio script del cutscene
+  (`*(int*)(*(int*)(param_1+8)+4)`), cargado desde `assets/script/output.dlg`. No hay forma de confirmar
+  desde disassembly estático qué id concreto carga ese script para el cutscene en cuestión, y nuestro
+  código no transforma ni reinterpreta ese id en ningún punto (`m_OnSoundPlay`/`audio_play()` lo reciben
+  y usan tal cual llega del `.so`) -- aplicar un fix a ciegas sin confirmar el id real sería especulativo,
+  y podría ser tanto un id genuinamente distinto al esperado por el propio juego (poco probable, ya que
+  el `.so` es binario original) como una percepción influenciada por la menor fidelidad que tenía el
+  audio hasta el Bug #17 (ahora corregido) -- imposible de distinguir sin un dato concreto.
+- **Siguiente paso (ya instrumentado):** se agregó un log de diagnóstico en `source/java.c`
+  (`m_OnSoundPlay`): `l_info("m_OnSoundPlay: id=%d vol=%d loop=%d", ...)` en cada llamada real del
+  motor. La próxima vez que el usuario reproduzca el cutscene en cuestión con el "Servidor de Logs en
+  Vivo" del toolkit activo, `logs/live_session_*.log` va a tener el id/volumen/loop exactos que pide el
+  `.so` en ese momento -- eso confirma o descarta de una vez si el id es realmente distinto al rango
+  100+, sin seguir adivinando.
+- **Estado:** sin fix todavía -- pendiente del log real del próximo intento del usuario. **Actualización:**
+  el primer log real recibido (`logs/game_023.log`, ver Bug #19) NO cubre ese cutscene -- los únicos ids
+  vistos ahí son 0,3,6,9,10,12,15,58,65, ninguno en 046-055 ni en 100+ -- así que sigue sin confirmarse ni
+  descartarse. Sí aporta un dato relevante para la hipótesis original: el propio `.so`, en este log, usa
+  ids bien por debajo de 100 (58 y 65) como música/ambiente en loop de una zona real de juego -- confirma
+  que "música = id ≥ 100" NO es una convención real del motor (era una heurística nuestra, ya descartada
+  desde el Bug #14), así que la expectativa de que el cutscene "debería" usar un id ≥100 podría no aplicar
+  tampoco. Sigue pendiente el log del cutscene puntual para cerrar esto con certeza.
+
+### Bug #19 confirmado y resuelto (2026-09-02) -- Todo el audio sonaba "muy fuerte y distorsiona" -- escala de volumen equivocada (/10 en vez de /100)
+
+- **Síntoma:** reportado por el usuario -- el sonido se escucha muy fuerte y distorsiona en general; en
+  el ingame, en vez de música suena uno de los efectos en loop (ver actualización del Bug #18 arriba).
+- **Confirmado con el primer log real recibido (`logs/game_023.log`, gracias al log de diagnóstico del
+  Bug #18):** de las 55 llamadas a `m_OnSoundPlay` registradas en toda la partida -- BGM/loop (ids 58, 65)
+  y SFX por igual (ids 0,3,6,9,10,12,15) -- **las 55 mandan `vol=100`, sin una sola excepción.** Esto
+  confirma que la unidad real de volumen del motor es una escala 0-100 (probablemente un porcentaje), no
+  el rango 0-10 que asumía `source/utils/audio.c` desde el principio (mucho antes de esta sesión).
+- **Causa Raíz:** el mezclador dividía por 10 (`sample * vol / 10`) tanto en el canal de loop/BGM como en
+  el pool de SFX. Con `vol=100` real, eso amplifica cada muestra **10x**. El clamp de saturación agregado
+  en el Bug #16 evita que ese desborde dé la vuelta (wraparound / ruido digital tipo aliasing), pero no
+  soluciona el problema de fondo: con una ganancia de 10x, prácticamente cualquier muestra que no sea casi
+  silencio queda recortada contra ±32767 (hard clipping) -- **fuerte y distorsionado**, tal como reportó
+  el usuario después del fix del Bug #16 (ese fix corrigió el tipo de ruido, no el volumen de fondo).
+- **Fix:** en `source/utils/audio.c`, se agregó `#define VOLUME_SCALE 100` (con el log real citado en el
+  comentario, no un número adivinado) y se reemplazó el divisor `/10` por `/VOLUME_SCALE` en ambos canales
+  de mezcla (loop/BGM y SFX). Con `vol=100` real, esto da ganancia unitaria exacta (sin amplificar ni
+  atenuar) -- el clamp de saturación se mantiene como red de seguridad barata por si algún sonido supera
+  el rango de 16 bits por sí solo o el motor llegara a mandar un volumen mayor a 100.
+- **Estado:** corregido en código. Pendiente de build/deploy y confirmación del usuario en consola.
+
+### Bug #20 confirmado y resuelto (2026-09-02) -- LA causa raíz real: el `.so` nunca manda el número de archivo, manda un ÍNDICE de lista
+
+Reportado por el usuario -- instaló Illusia 2 en Android y confirmó que el menú tiene música y el
+in-game tiene OTRA música distinta (no un efecto en loop). Pidió revisar a fondo el desensamblado de
+cómo se gestiona el sonido antes de seguir parcheando síntomas.
+
+- **El hallazgo, en orden de cómo se llegó a él:**
+  1. `CGsSound::PlaySound(int,int,uchar)` (`out_ghidra.c:19311`) NUNCA pasa el id literal que recibe
+     (`param_1`) a `MC_androidPlaySound`. Primero llama
+     `iVar1 = GetSoundIDListIdx(this, param_1)` (`out_ghidra.c:18499`, busca `param_1` dentro de un
+     arreglo registrado en `this+0x70`/`this+0x74` y devuelve su POSICIÓN, no el valor) y es **`iVar1`**
+     (el índice) lo que llega a `MC_androidPlaySound(iVar1, param_2, param_3)` → `playAndroidSound`
+     (`out_ghidra.c:116148`) → JNI `OnSoundPlay` → nuestro `m_OnSoundPlay`.
+  2. Ese arreglo registrado se construye en `CMvApp::EvAppStart()` (`out_ghidra.c:31927`):
+     `CGsSound::OnCreate(this_03, 0x46, (int*)&DAT_00113a70)` -- copia **70** (`0x46`) enteros desde
+     `DAT_00113a70` directo al arreglo. Se leyeron esos 70 enteros **directo del `.so` real**
+     (`illusia_extract/lib/armeabi/libgameDSO.so`, no inferido): usando el mismo offset de `-0x10000`
+     entre direcciones de Ghidra y direcciones reales ya documentado para los placeholders de vtable
+     (ver el triage de `KnockProcWhenAttack`, 2026-08-22), `DAT_00113a70 - 0x10000 = 0x00103a70` cae
+     dentro de `.data` (confirmado con `objdump -h`/`-p`); calculando el offset de archivo real
+     (`vaddr - 0x1000` para el segundo segmento `LOAD`) y leyendo 70 enteros de 4 bytes ahí, el
+     resultado es **exactamente**:
+     `[0,1,2,5,6,10,13,14,15,16,17,18,20,22,23,33,36,37,38,39,40,41,42,44,45,46,47,54,55,56,57,58,59,60,
+     61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,100,101,102,103,104,105,106,
+     108,110,111,120,121]` -- byte a byte, la misma lista de 70 ids válidos que ya conocíamos por
+     `res/raw/`/`assets/sound/` (Bug #17), en el mismo orden.
+  3. Esto es invisible en Android porque `aapt` asigna los ids de recursos de `res/raw/sNNN.ogg` en el
+     mismo orden alfabético/ascendente -- `R.raw.s000 + i` (`NexusSound.playSound`,
+     `IllusiaUIControllerView.OnSoundPlay`) cae en el archivo correcto solo porque ambas listas están
+     ordenadas igual. Nuestro código, en cambio, tomaba ese índice y lo usaba directo como número de
+     archivo literal (`snprintf("%03d.caf", index)`) -- correcto por pura coincidencia solo para los ids
+     0, 1 y 2 (sin huecos todavía en la lista antes de esa posición), y equivocado para prácticamente
+     todo lo demás.
+  4. **Confirmado contra `logs/game_023.log`:** `index=65` (loop=1) y `index=58` (loop=1) -- que nuestro
+     código viejo tocaba como los archivos sueltos `065.caf`/`058.caf` -- son la posición 65 y 58 de la
+     tabla de arriba, que valen **108** y **100** respectivamente. **108 es exactamente
+     `RES_BGM_TITLE`** (el string de debug del `.so` que ya habíamos cruzado en el Bug #16,
+     `CGsSound::Play(ms,0x6c=108,-1,'\x01')`), y **100 es la primera pista de música dedicada al
+     in-game** (rango que ya usábamos como "BGM" desde antes, Fase 4) -- exactamente lo que el usuario
+     esperaba encontrar (música real, distinta entre menú e in-game) y no encontraba.
+- **Fix (`source/utils/audio.c`):** se agregó `sound_index_table[70]` con la tabla exacta de arriba y
+  `sound_index_to_real_id()`, que traduce el índice recibido en `audio_play()` al id de archivo real
+  ANTES de tocar `load_caf()`/los canales de mezcla. `audio_play()` ahora loguea
+  `index=%d -> real_id=%d vol=%d loop=%d` en cada llamada para que cualquier log futuro muestre la
+  traducción directamente. Este único fix resuelve de raíz el Bug #18 (cutscene con id "equivocado") y
+  el reporte de este mensaje (in-game con efecto en loop en vez de música) -- ambos eran el mismo bug.
+- **Además, migrado el backend de audio de `sceAudioOut` a SDL2** (pedido explícito del usuario): se
+  reemplazó `sceAudioOutOpenPort`/`sceAudioOutOutput`/el hilo propio (`sceKernelCreateThread` +
+  `while(audio_running)`) por `SDL_OpenAudioDevice()` con un callback (`sdl_audio_callback`) que llama a
+  la misma lógica de mezclado ya existente (`mix_audio()`, extraída del viejo `audio_thread()` sin
+  cambios de comportamiento, solo parametrizada por cantidad de frames en vez de la constante `GRAIN`
+  fija). El gate de sincronización del Bug #15 (`audio_gate_open`/`audio_open_gate()`) se mantiene igual,
+  ahora chequeado dentro de `mix_audio()`. `CMakeLists.txt` linkea `SDL2` (agregado antes de
+  `libvitaGL.a` en `target_link_libraries`).
+- **Logging agregado (pedido explícito del usuario, "todos los posibles para atrapar el bug"):**
+  `load_caf` loguea archivo+frames+duración al cargar (o warning si falta el archivo o el chunk `data`),
+  `audio_play` loguea índice→id real→vol→loop en cada llamada, `audio_stop_bgm`/`audio_stop_all` loguean
+  cuándo se llaman, `audio_open_gate` loguea cuándo se abre, y `sound_index_to_real_id` loguea un warning
+  si el `.so` llega a mandar un índice fuera de rango (0-69) -- caso no visto todavía pero que indicaría
+  una tabla desactualizada o un id nuevo no contemplado.
+- **Estado:** corregido en código. Pendiente de confirmación del usuario en consola de que ahora sí suena
+  música real en el in-game y en cutscenes.
+
+### Bug del build (2026-09-02) -- `SDL2/SDL.h: No such file or directory` + link errors, resuelto
+
+- **Síntoma:** el primer build real del usuario tras el Bug #20 falló en `source/utils/audio.c:1:10:
+  fatal error: SDL2/SDL.h: No such file or directory` -- el paquete SDL2 de vitasdk nunca había sido
+  instalado en su VITASDK (`vdpm` nunca se había corrido para `sdl2` en esta máquina).
+- **Fix:** esta vez sí se pudo verificar en la propia máquina del usuario -- `$VITASDK` no estaba
+  exportado en el shell de esta sesión, pero el SDK real vive en `~/vitasdk` (con `vdpm` en
+  `~/vitasdk/bin/`). Se corrió `vdpm sdl2`, que descargó e instaló
+  `~/vitasdk/arm-vita-eabi/include/SDL2/*.h` + `libSDL2.a`/`libSDL2main.a`. Con eso, `audio.c` compiló,
+  pero el LINK falló distinto: `libSDL2.a` es un solo archivo estático que empaqueta TODOS los
+  subsistemas de SDL2 (video/joystick/sensor/audio/etc.), no solo audio -- el linker arrastra el backend
+  de video de Vita (`SDL_vitavideo.c.obj`), que usa el teclado en pantalla (`sceImeOpen/Close/SetCaret/
+  SetText/Update`) aunque el juego nunca llama a la API de video de SDL2. Se agregó `SceIme_stub` al
+  `target_link_libraries` de `CMakeLists.txt` (junto a `SDL2`) para resolver esos símbolos.
+- **De paso, se corrigió el warning de `sceIoMkdir` implícito** que aparecía en el mismo log de build
+  (`source/utils/init.c`): faltaba `#include <psp2/io/dirent.h>` (donde vive esa función) -- agregado
+  junto a los demás includes de `psp2/*` del archivo. Era solo un warning (no bloqueaba el build), pero
+  se corrigió de una vez ya que apareció en el mismo log compartido.
+- **Build verificado localmente de punta a punta** (`cmake` + `make -j4` sobre un directorio de
+  scratch, sin tocar el `build/` que administra el toolkit del usuario): compila y linkea limpio,
+  genera `illusia.vpk`/`eboot.bin` sin errores nuevos. **Sigue sin probarse en consola/Vita3K** -- eso
+  queda para la próxima corrida real del usuario.
+- **Estado:** corregido y verificado con build real (no solo teoría). Pendiente de probar en consola.
