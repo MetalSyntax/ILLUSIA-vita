@@ -1442,3 +1442,49 @@ cómo se gestiona el sonido antes de seguir parcheando síntomas.
   genera `illusia.vpk`/`eboot.bin` sin errores nuevos. **Sigue sin probarse en consola/Vita3K** -- eso
   queda para la próxima corrida real del usuario.
 - **Estado:** corregido y verificado con build real (no solo teoría). Pendiente de probar en consola.
+
+### Investigación en curso -- FPS cae a ~3 al cambiar de stage, "se ve el mapa" brevemente (reportado por el usuario, 2026-09-02)
+
+- **Síntoma:** al pasar de un área a otra, el juego se traba (FPS cae a ~3) por un instante, y durante
+  ese momento se ve "el mapa" -- al usuario le resultó raro, dura milisegundos.
+- **Cruce con el pseudo-C real:** el cambio de área real pasa por `CMvMap::DoMapChange()`
+  (`out_ghidra.c:65562`): `Release()` (libera el mapa actual) → `Load(newMapId, true)` (carga todo el
+  mapa nuevo -- tiles, objetos, NPCs, todo por I/O síncrona, motor sin hilos confirmado en Fase 3) →
+  si carga bien, reproduce el BGM del mapa nuevo (`PlayMapBGM`, ver Bug #16/#20) → **y, si
+  `CMvGameUI+0x140 == 0` y el "tipo" del mapa nuevo (tabla XLS 6, columna 1) no es 6, llama
+  `OpenWorldMap()` directo, sin condición de usuario, como parte del flujo normal de cambio de mapa.**
+  Esto significa que **"se ve el mapa" después de ciertas transiciones es comportamiento real y original
+  del motor** (mostrar la pantalla de World Map automáticamente en ciertos mapas de campo), no
+  necesariamente un glitch nuestro -- pero no se puede confirmar al 100% sin ver el log real de qué
+  hook se dispara y con qué resultado.
+- **Hipótesis sobre la causa del freeze (con fix ya aplicado, no especulativo):** `CMvMap::Load()` hace
+  toda su carga de archivos vía `fopen`/`fread` síncronos (confirmado, sin `AAssetManager`, Fase 3), y
+  nuestras propias utilidades de archivo (`source/utils/utils.c`) hacían **una llamada extra a
+  `sceIoGetstat()` (vía `file_exists()`) antes de cada `fopen()`** en `file_load()`/`file_size()` -- un
+  syscall real de más por archivo, encima de los que ya hacían falta (`fopen`+`fseek`+`fseek`+`fread`+
+  `fclose`). Una transición de área puede implicar decenas de archivos (mapa, tilesets, sprites, script)
+  abiertos uno tras otro -- cada round-trip a `sceIo*` en el almacenamiento real de la Vita tiene latencia
+  no despreciable, coincide con el patrón de "freeze de una fracción de segundo" reportado.
+- **Fix aplicado (mejora de rendimiento, no cambia comportamiento):**
+  - `source/utils/utils.c`: se quitó el `file_exists()` redundante en `file_load()`/`file_size()` --
+    ahora se confía directamente en que `fopen()` devuelva `NULL` si el archivo no existe, en vez de
+    stat-earlo primero. Aplica a todo el juego, no solo a transiciones de mapa.
+  - `source/reimpl/io.c`: `fopen_soloader()` (la función que usa el `.so` para TODOS sus propios
+    `fopen()`, incluida toda la carga de mapas/tilesets/sprites) ahora llama `setvbuf(..., _IOFBF, 64KB)`
+    justo después de abrir el archivo -- el buffer chico por defecto de stdio convertía la lectura de un
+    archivo mediano en muchas llamadas `sceIoRead` pequeñas; un buffer más grande significa menos
+    llamadas más grandes para los mismos datos, mismo comportamiento observable.
+- **Instrumentación de diagnóstico agregada (sin cambiar comportamiento) en `source/patch.c`:**
+  - `CMvMap::Load` (`_ZN6CMvMap4LoadEib`): mide con `current_timestamp_ms()` cuánto tarda de verdad
+    cada carga de mapa y loguea `CMvMap::Load(map_id=%d) -> %d took %llu ms`.
+  - `CMvMap::OpenWorldMap` (`_ZN6CMvMap12OpenWorldMapEv`): loguea cada vez que se llama y su resultado
+    (0 = no llegó a abrir nada de verdad, ej. `GetMapIDForWorldMap()` no encontró nada).
+- **Build verificado localmente** (mismo procedimiento que el bug anterior): compila y linkea limpio,
+  `illusia.vpk` generado sin errores.
+- **Próximo paso:** correr esto en consola con el "Servidor de Logs en Vivo" activo, reproducir una
+  transición de área, y mandar el log -- va a confirmar (1) cuánto bajó el tiempo real de `CMvMap::Load`
+  con el fix de I/O, y (2) si `OpenWorldMap()` se dispara justo en ese momento (confirmando que "el
+  mapa" es el World Map real del juego, esperado en esa transición) o si el freeze/mapa vienen de otro
+  lado no contemplado todavía.
+- **Estado:** mejora de I/O aplicada y verificada con build real; diagnóstico instrumentado. Pendiente
+  del log real del usuario para confirmar la causa exacta y si hace falta más trabajo.

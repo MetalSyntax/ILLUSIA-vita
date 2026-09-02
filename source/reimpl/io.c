@@ -54,6 +54,22 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
 
     if (ret) {
         l_debug("fopen(%s, %s): %p", clean_path, mode, ret);
+        // The .so reads every one of its own assets (map/tileset/sprite/
+        // script files) straight through this fopen -- stdio's default
+        // buffer (a few KB) means a single moderately-sized file turns into
+        // many small sceIoRead syscalls, each with real Vita storage
+        // latency. A stage transition can open and stream dozens of these
+        // files back to back, and that per-syscall overhead is a real,
+        // measurable contributor to the multi-hundred-ms stall ("3 FPS for
+        // a moment") reported when changing areas. A bigger buffer means
+        // fewer, larger reads for the same data -- purely a performance
+        // knob, same read()/fread() semantics either way. Best-effort: if
+        // this fails, stdio just keeps its default buffer.
+    #ifdef USE_SCELIBC_IO
+        sceLibcBridge_setvbuf(ret, NULL, _IOFBF, 64 * 1024);
+    #else
+        setvbuf(ret, NULL, _IOFBF, 64 * 1024);
+    #endif
     } else {
         l_warn("fopen(%s, %s): %p", clean_path, mode, ret);
     }

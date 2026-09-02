@@ -75,12 +75,15 @@ bool file_load(const char * path, uint8_t ** buffer, size_t * size) {
         return false;
     }
 
-    if (!file_exists(path)) {
-        l_error("file_load: Specified source path \"%s\" "
-                "does not exist.", path);
-        return false;
-    }
-
+    // Used to sceIoGetstat() the path before every open just to report a
+    // nicer "does not exist" message -- an extra real IO syscall per file,
+    // on top of the ones fopen/fseek/fseek/fread/fclose already need, for a
+    // check fopen()'s own NULL return already gives us for free. Asset
+    // loading during a stage transition can be dozens of these calls back to
+    // back (map/tileset/sprite/script files), and each sceIo* round-trip has
+    // real latency on Vita's storage -- confirmed contributor to the
+    // multi-hundred-ms stalls ("3 FPS for a moment") reported when changing
+    // areas. Just try to open it.
 #ifdef USE_SCELIBC_IO
     FILE * f = sceLibcBridge_fopen(path, "rb");
 #else
@@ -187,12 +190,6 @@ bool file_save(const char * path, const uint8_t * buffer, size_t size) {
 
 size_t file_size(const char * path) {
     size_t ret = -1;
-
-    if (!file_exists(path)) {
-        l_error("size_t: Specified source path \"%s\" "
-                "does not exist.", path);
-        return ret;
-    }
 
 #ifdef USE_SCELIBC_IO
     FILE * f = sceLibcBridge_fopen(path, "rb");

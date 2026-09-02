@@ -256,6 +256,44 @@ static uint32_t hooked_GsFSFileSize(const char *name, int mode) {
     return size;
 }
 
+// Investigation (reported by the user, 2026-09-02): FPS drops to ~3 for a
+// moment when walking between stages/areas, and "the map" briefly shows up,
+// which looked wrong to them. Two diagnostic-only hooks (same SO_CONTINUE/
+// SO_CONTINUE_VOID passthrough pattern as everywhere else in this file, zero
+// behavior change) to get real numbers instead of guessing:
+//   1. CMvMap::Load(int,bool) -- the actual per-transition asset load (called
+//      from CMvMap::DoMapChange, out_ghidra.c:65562, right after Release()).
+//      Times how long it really takes; a real log will show whether the
+//      stall is genuinely spent here (most likely, given every asset is read
+//      through synchronous fopen/fread with no threading -- confirmed
+//      pthread-free .so, port_progress.md Fase 3) or somewhere else.
+//   2. CMvMap::OpenWorldMap() -- out_ghidra.c:65562's own DoMapChange() calls
+//      this directly, unconditionally, right after loading certain field
+//      maps (when CMvGameUI+0x140 == 0 and the new map's XLS-table-6 type
+//      isn't 6) -- i.e. auto-opening the World Map screen after some map
+//      transitions IS real, original engine behavior, not a bug we
+//      introduced. Logging when it fires (and its return value: 0 means it
+//      didn't actually open, e.g. GetMapIDForWorldMap() found nothing) tells
+//      us whether "shows the map" is this feature legitimately running, just
+//      made jarring by how slow the load before it is.
+static so_hook hook_CMvMap_Load;
+
+static int hooked_CMvMap_Load(void *this_ptr, int map_id, int unk) {
+    uint64_t start = current_timestamp_ms();
+    int ret = SO_CONTINUE(int, hook_CMvMap_Load, this_ptr, map_id, unk);
+    l_info("CMvMap::Load(map_id=%d) -> %d took %llu ms", map_id, ret,
+           (unsigned long long) (current_timestamp_ms() - start));
+    return ret;
+}
+
+static so_hook hook_CMvMap_OpenWorldMap;
+
+static int hooked_CMvMap_OpenWorldMap(void *this_ptr) {
+    int ret = SO_CONTINUE(int, hook_CMvMap_OpenWorldMap, this_ptr);
+    l_info("CMvMap::OpenWorldMap() -> %d", ret);
+    return ret;
+}
+
 static void patch_symbol(const char *symbol_name, uintptr_t target_func) {
     uintptr_t addr = so_symbol(&so_mod, symbol_name);
     if (addr) {
@@ -344,6 +382,25 @@ void so_patch(void) {
     // Bug #13 fix (see comment above hooked_GsFSFileSize): full replacement,
     // not a passthrough -- the original always returns 0.
     patch_symbol("_Z12GsFSFileSizePKci", (uintptr_t)&hooked_GsFSFileSize);
+
+    // Stage-transition FPS/"map flash" investigation (see comment above
+    // hooked_CMvMap_Load): diagnostic-only, times the real per-transition
+    // load and logs every CMvMap::OpenWorldMap() call.
+    uintptr_t cmv_map_load_addr = so_symbol(&so_mod, "_ZN6CMvMap4LoadEib");
+    if (cmv_map_load_addr) {
+        hook_CMvMap_Load = hook_addr(cmv_map_load_addr, (uintptr_t)&hooked_CMvMap_Load);
+        l_info("Hooked CMvMap::Load -> 0x%08x", (unsigned int) cmv_map_load_addr);
+    } else {
+        l_warn("Symbol CMvMap::Load not found for hooking");
+    }
+
+    uintptr_t cmv_map_open_world_map_addr = so_symbol(&so_mod, "_ZN6CMvMap12OpenWorldMapEv");
+    if (cmv_map_open_world_map_addr) {
+        hook_CMvMap_OpenWorldMap = hook_addr(cmv_map_open_world_map_addr, (uintptr_t)&hooked_CMvMap_OpenWorldMap);
+        l_info("Hooked CMvMap::OpenWorldMap -> 0x%08x", (unsigned int) cmv_map_open_world_map_addr);
+    } else {
+        l_warn("Symbol CMvMap::OpenWorldMap not found for hooking");
+    }
 
     // Bypass dead online multiplayer/auction network subsystems
     patch_symbol("_ZN14CMvNetworkMenu11ResetKeyMapEv", (uintptr_t)&hooked_CMvNetworkMenu_ResetKeyMap);
